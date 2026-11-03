@@ -1,0 +1,42 @@
+{
+  "name": "dsh-harmony-watch",
+  "version": "2.0.0",
+  "description": "把手表/手机接到电脑上的 DeepSeek Harness：局域网自动发现 + 6 位码配对，实时看模型动作、远程发指令、手表上审批提权，支持外网隧道。",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "watch-event-text.mjs",
+    "watch-model-control.mjs",
+    "watch-tunnel-bin.mjs"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "watch",
+    "wear",
+    "remote",
+    "approval"
+  ],
+  "engines": {
+    "node": ">=20"
+  }
+}

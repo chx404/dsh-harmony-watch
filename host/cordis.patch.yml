@@ -1,0 +1,32 @@
+# dsh-watch bundle 层：电脑端 HTTP/SSE 服务 + 手表审批应答者 + 局域网发现/配对。
+# id 必须与 package name 一致；配置改动可以直接改 profile 的 cordis.patch.yml（id-targeted 补丁整体替换 config）。
+- insert:
+    - id: dsh-harmony-watch
+      name: dsh-harmony-watch
+      config:
+        port: 8765
+        bind: 0.0.0.0
+        approvalMode: watch
+        approvalTimeoutMs: 60000
+        defaultCwd: ""
+        maxText: 400
+        # 局域网自动发现（手表 App 广播 UDP，插件应答）；不用就设 false
+        discovery: true
+        discoveryPort: 8766
+        # 6 位配对码有效期（毫秒）
+        pairingTtlMs: 86400000
+        # 外网隧道：off / ssh / cloudflared / cloudflared-token / frp
+        # auto：有 tunnelToken 走固定隧道，否则 cloudflared 快隧道，再退 ssh
+        tunnel: auto
+        # Cloudflare 固定隧道 token（配 remoteUrl 指定自己的域名）
+        tunnelToken: ""
+        # frp 服务端；frp 模式需要 remoteUrl 指向对外地址
+        frpServer: ""
+        frpServerPort: 7000
+        frpToken: ""
+        frpRemotePort: 0
+        # 自己已有隧道或反向代理时，直接填对外地址（优先级最高）
+        remoteUrl: ""
+        tunnelHost: localhost.run
+        tunnelPort: 22
+        tunnelUser: nokey

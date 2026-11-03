@@ -1,0 +1,8 @@
+node_modules/
+build/
+.hvigor/
+backups/
+local.properties
+*.hap
+*.log
+.DS_Store

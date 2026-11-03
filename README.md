@@ -1,0 +1,92 @@
+# dsh-harmony-watch
+
+在鸿蒙手表上遥控 DeepSeek Harness（DSH）的轻量客户端：看模型动作、发指令、审批提权、切会话、切模型。手表走 HTTP 轮询，手机或电脑跑一个 DSH 插件做桥。
+
+> A HarmonyOS watch remote for DeepSeek Harness: live tool stream, prompts, approvals, session and model switching. The watch talks to a small DSH plugin over HTTP.
+
+## 组成
+
+```
+鸿蒙手表 App ──HTTP/轮询──▶ dsh-harmony-watch 插件（跑在 DSH 进程里）
+                              ├── 审批转发（先于 Web UI）
+                              ├── 工具/回复事件流
+                              ├── 指令下发（followup / steer）
+                              ├── 会话列表与恢复
+                              └── 当前会话模型切换
+```
+
+- `watch-app/`：鸿蒙工程（ArkTS，API 20+，WATCH 系列圆屏）
+- `host/`：DSH 插件，零依赖，只用 Node 内建模块
+- `scripts/`：一键安装脚本
+
+## 快速开始
+
+### 1. 装插件
+
+```bash
+./scripts/install.sh web      # macOS / Linux
+powershell -File scripts/install.ps1 web   # Windows
+```
+
+脚本会装插件、备好 cloudflared，并打印后续配置提示。装完重启 DSH。
+
+### 2. 装手表 App
+
+用 DevEco Studio 或自己的工具链编译 `watch-app/`，签名后侧载到手表。
+
+### 3. 配对
+
+启动日志里会打印 6 位配对码和外网地址；手机浏览器打开 `http://127.0.0.1:8765/pair` 也能看。
+
+手表连接页填地址和配对码，配对码一天内有效。
+
+## 远程连接
+
+插件默认 `tunnel: auto`，按顺序选择：
+
+1. **局域网**：同一 Wi-Fi，填 `IP:8765`，零配置
+2. **cloudflared 快速隧道**：没配置时自动下载并拉起，地址每次重启会变
+3. **固定隧道**：配置 `tunnelToken` 和 `remoteUrl`，地址不变
+4. **frp**：`tunnel: frp` 加 `frpServer` 等四项，需要自己的服务器和 frpc
+
+手表会记住内网、外网两个地址。设置里可选「自动 / 内网 / 外网」：自动模式走外网时每 30 秒探测一次内网，回到同一 Wi-Fi 自动切回。
+
+## 配置
+
+改 profile 的 `cordis.patch.yml`，给 `dsh-harmony-watch` 加字段：
+
+```yaml
+- id: dsh-harmony-watch
+  name: dsh-harmony-watch
+  config:
+    port: 8765
+    tunnel: auto
+    pairingTtlMs: 86400000
+    # tunnelToken: <Cloudflare 隧道 token>
+    # remoteUrl: https://你的域名
+    # frpServer: 你的服务器
+    # frpRemotePort: 6000
+```
+
+## 桌面端兼容性
+
+代码不依赖 Android 或 proot，路径走 `os.homedir()`，子进程走 `spawn`。插件用的 DSH 服务：
+
+`agents` / `sessions` / `agentPresets` / `agentDefaultModel` / `sessionPersistence` / `sessionTitle`，模型切换额外用 `sessionController` 和 `llm`（拿不到就明确失败，不影响其他功能）。
+
+**尚未在 Windows / macOS 桌面端实机验证**，目前只在 Android proot 里的 DSH 0.2.1-rc.4 跑通。已知风险：
+
+- Windows 下 cloudflared 下载与路径处理
+- 桌面端防火墙首次放行 8765
+- 不同 DSH 版本的服务接口差异，缺服务时会降级或报错
+
+## 已知限制
+
+- 快速隧道地址会变，长期使用建议固定隧道或 frp
+- 手表端图片消息暂不显示（只转文本）
+- 审批卡片只展示工具名和原因摘要
+- 手表需侧载，签名和安装流程因设备而异
+
+## License
+
+MIT

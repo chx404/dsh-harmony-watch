@@ -1,0 +1,15 @@
+import UIAbility from '@ohos.app.ability.UIAbility';
+import window from '@ohos.window';
+import hilog from '@ohos.hilog';
+
+export default class EntryAbility extends UIAbility {
+  onWindowStageCreate(windowStage: window.WindowStage): void {
+    windowStage.loadContent('pages/Index', (err) => {
+      if (err.code) {
+        hilog.error(0x0000, 'DSHWatch', 'loadContent failed: %{public}s', JSON.stringify(err));
+        return;
+      }
+      hilog.info(0x0000, 'DSHWatch', 'loadContent ok');
+    });
+  }
+}
