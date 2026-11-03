@@ -2,7 +2,12 @@
 
 在鸿蒙手表上遥控 DeepSeek Harness（DSH）的轻量客户端：看模型动作、发指令、审批提权、切会话、切模型。手表走 HTTP 轮询，手机或电脑跑一个 DSH 插件做桥。
 
-> A HarmonyOS watch remote for DeepSeek Harness: live tool stream, prompts, approvals, session and model switching. The watch talks to a small DSH plugin over HTTP.
+> A HarmonyOS watch remote for DeepSeek Harness: live tool stream, prompts, approvals, session and model switching.
+
+> **关于作者**
+>
+> 这个项目由一名初三学生利用课余时间、在 AI 辅助下完成。能力和时间都有限，难免有粗糙或者没考虑到的地方，请多包涵。遇到问题欢迎提 issue，我会尽量修。
+ The watch talks to a small DSH plugin over HTTP.
 
 ## 组成
 
