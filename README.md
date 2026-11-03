@@ -79,7 +79,7 @@ powershell -File scripts/install.ps1 web   # Windows
 
 `agents` / `sessions` / `agentPresets` / `agentDefaultModel` / `sessionPersistence` / `sessionTitle`，模型切换额外用 `sessionController` 和 `llm`（拿不到就明确失败，不影响其他功能）。
 
-**尚未在 Windows / macOS 桌面端实机验证**，目前只在 Android proot 里的 DSH 0.2.1-rc.4 跑通。已知风险：
+目前只在 **Android 版 dsh-go 的 proot 环境**（DSH 0.2.1-rc.4）实机验证过，没有在 Windows / macOS 桌面端测过。已知风险：
 
 - Windows 下 cloudflared 下载与路径处理
 - 桌面端防火墙首次放行 8765
