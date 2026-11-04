@@ -14,6 +14,23 @@ export function messageBody(message) {
   return out.join('\n');
 }
 
+// 图片块只带元数据（附件 id / 尺寸），真正的字节由 /api/image 按需取。
+// offloaded 的图片已经不在会话里，跳过。
+export function messageImages(message) {
+  const out = []
+  const visit = (blocks) => {
+    if (!Array.isArray(blocks)) return
+    for (const block of blocks) {
+      if (!block || typeof block !== 'object') continue
+      if (block.type === 'image' && block.attachment && typeof block.attachment === 'object') {
+        if (!block.offloaded) out.push(block.attachment)
+      } else if (block.type === 'tool-result') visit(block.content)
+    }
+  }
+  visit(message?.content)
+  return out
+}
+
 export function argumentsBody(raw) {
   if (typeof raw !== 'string') return raw == null ? '' : JSON.stringify(raw, null, 2);
   try { return JSON.stringify(JSON.parse(raw), null, 2); }

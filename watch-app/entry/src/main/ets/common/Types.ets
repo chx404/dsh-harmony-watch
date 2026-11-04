@@ -1,3 +1,12 @@
+export interface DshImage {
+  attachmentId: string;
+  mediaType: string;
+  width: number;
+  height: number;
+  bytes?: number;
+  name?: string;
+}
+
 export interface DshEvent {
   seq: number;
   t: number;
@@ -12,6 +21,7 @@ export interface DshEvent {
   outcome?: string;
   reason?: string;
   hasDetail?: boolean;
+  images?: DshImage[];
 }
 
 export interface SessionInfo {

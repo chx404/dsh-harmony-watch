@@ -21,13 +21,13 @@ import { createSocket } from 'node:dgram'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir, hostname, networkInterfaces } from 'node:os'
 import { join } from 'node:path'
-import { messageBody, argumentsBody, publicEvent } from './watch-event-text.mjs'
+import { messageBody, messageImages, argumentsBody, publicEvent } from './watch-event-text.mjs'
 import { createWatchModelControl } from './watch-model-control.mjs'
 import { ensureBinary, binaryPath, findFrpc } from './watch-tunnel-bin.mjs'
 
 export const name = 'dsh-harmony-watch'
 
-const VERSION = '2.0.0'
+const VERSION = '2.0.1'
 const RING_MAX = 400
 const TOKEN_HEADER = 'x-dsh-watch-token'
 
@@ -784,13 +784,15 @@ ${(typeof tunnelState !== 'undefined' && tunnelState.url)
     if (ev.type === 'user/message') {
       if (ev.data?.source?.kind !== 'user') return undefined
       const text = messageBody(ev.data)
-      if (!text) return undefined
-      return { sessionId, kind: 'user', text }
+      const images = messageImages(ev.data)
+      if (!text && images.length === 0) return undefined
+      return { sessionId, kind: 'user', text, images }
     }
     if (ev.type === 'assistant/message') {
       const text = messageBody(ev.data?.message)
-      if (!text) return undefined
-      return { sessionId, kind: 'assistant', text }
+      const images = messageImages(ev.data?.message)
+      if (!text && images.length === 0) return undefined
+      return { sessionId, kind: 'assistant', text, images }
     }
     if (ev.type === 'tool/call') {
       const preview = summarizeToolArgs(ev.data?.name, ev.data?.arguments, 180)
@@ -1106,12 +1108,13 @@ ${(typeof tunnelState !== 'undefined' && tunnelState.url)
     }
   }
 
-  function configureSelection(agentCtx, agent) {
+  function configureSelection(agentCtx, agent, control) {
     // 网页和手表共用同一份会话模型选区，不能再叠一层路由覆盖。
-    if (!modelControl.mount(agent)) installSelection(agentCtx, selectionFor(agent))
+    // control 显式传入：单测会单独 eval 这段代码，不能依赖外层闭包。
+    if (!control || !control.mount(agent)) installSelection(agentCtx, selectionFor(agent))
   }
 
-  async function composeSetup() {
+  async function composeSetup(control) {
     const presets = (() => {
       try {
         return ctx.get('agentPresets')
@@ -1120,19 +1123,19 @@ ${(typeof tunnelState !== 'undefined' && tunnelState.url)
       }
     })()
     if (!presets) {
-      return { setup: (agentCtx, agent) => configureSelection(agentCtx, agent) }
+      return { setup: (agentCtx, agent) => configureSelection(agentCtx, agent, control) }
     }
     let resolved
     try {
       resolved = await presets.resolve(undefined)
     } catch (error) {
       warn('agentPresets 解析失败，按无预设组合处理', error && error.message)
-      return { setup: (agentCtx, agent) => configureSelection(agentCtx, agent) }
+      return { setup: (agentCtx, agent) => configureSelection(agentCtx, agent, control) }
     }
     return {
       presetId: resolved.id,
       setup: async (agentCtx, agent) => {
-        configureSelection(agentCtx, agent)
+        configureSelection(agentCtx, agent, control)
         await presets.mount(agentCtx, resolved.id)
       },
     }
@@ -1146,7 +1149,7 @@ ${(typeof tunnelState !== 'undefined' && tunnelState.url)
   async function createAgent(cwd) {
     const agents = ctx.get('agents')
     if (!agents) throw new Error('agents 服务不可用')
-    const composition = await composeSetup()
+    const composition = await composeSetup(modelControl)
     const sessionId = `session-${randomUUID()}`
     const handle = await agents.create({
       sessionId,
@@ -1166,7 +1169,7 @@ ${(typeof tunnelState !== 'undefined' && tunnelState.url)
   async function resumeAgent(sessionId) {
     const agents = ctx.get('agents')
     if (!agents) throw new Error('agents 服务不可用')
-    const composition = await composeSetup()
+    const composition = await composeSetup(modelControl)
     const handle = await agents.resume({
       resumeSessionId: sessionId,
       ...(agentOptionsFromPreset() === undefined ? {} : { agentOptions: agentOptionsFromPreset() }),
@@ -1569,6 +1572,35 @@ ${(typeof tunnelState !== 'undefined' && tunnelState.url)
       const event = state.events.find(item => item.seq === seq && item.sessionId === sessionId && item.t === timestamp)
       if (!event) return sendJson(res, 404, { ok: false, error: '该运行记录已不在缓存中，请重新打开会话。' })
       return sendJson(res, 200, { ok: true, sessionId, seq, text: event.detail ?? event.text ?? '' })
+    }
+
+    if (req.method === 'GET' && path === '/api/image') {
+      const seq = Number(url.searchParams.get('seq'))
+      const sessionId = url.searchParams.get('sessionId') ?? ''
+      const index = Number(url.searchParams.get('i') ?? 0)
+      const event = state.events.find(item => item.seq === seq && item.sessionId === sessionId)
+      const ref = Array.isArray(event?.images) ? event.images[index] : undefined
+      if (!ref) return sendJson(res, 404, { ok: false, error: '图片不在缓存里' })
+      let file = ''
+      try {
+        file = ctx.get('attachment')?.imageHostPath?.(ref) ?? ''
+      } catch {
+        file = ''
+      }
+      if (!file || !existsSync(file)) return sendJson(res, 404, { ok: false, error: '原图已不可用' })
+      let data
+      try {
+        data = readFileSync(file)
+      } catch {
+        return sendJson(res, 500, { ok: false, error: '读取失败' })
+      }
+      res.writeHead(200, {
+        'Content-Type': ref.mediaType || 'application/octet-stream',
+        'Content-Length': data.length,
+        'Cache-Control': 'private, max-age=600',
+      })
+      res.end(data)
+      return undefined
     }
 
     if (req.method === 'GET' && path === '/api/sessions') {

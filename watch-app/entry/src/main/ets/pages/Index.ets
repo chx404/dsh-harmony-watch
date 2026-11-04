@@ -1,12 +1,13 @@
 import preferences from '@ohos.data.preferences';
 import common from '@ohos.app.ability.common';
 import display from '@ohos.display';
+import notificationManager from '@ohos.notificationManager';
 import { BusinessError } from '@ohos.base';
 import {
   cancelTurn, decideApproval, fetchEventDetail, fetchModels, fetchSessions, fetchState, newSession, ping,
   normalizeUrl, pair, selectSession, sendPrompt, switchModel
 } from '../common/Net';
-import { DshEvent, ModelOption, PendingInfo, ProviderOption, SessionInfo, SimpleResult, StateSnapshot } from '../common/Types';
+import { DshEvent, DshImage, ModelOption, PendingInfo, ProviderOption, SessionInfo, SimpleResult, StateSnapshot } from '../common/Types';
 import { reconcileEventFeed, visibleFeedEvents } from '../common/EventFeed';
 
 const STORE = 'dsh_watch';
@@ -32,6 +33,44 @@ interface ActionItem {
   label: string;
   color: string;
   ring: string;
+}
+
+// 会话列表可能上百条，用懒加载数据源，滚动时只渲染可见项。
+class SessionDataSource implements IDataSource {
+  private listeners: DataChangeListener[] = [];
+  private items: SessionInfo[] = [];
+
+  totalCount(): number {
+    return this.items.length;
+  }
+
+  getData(index: number): SessionInfo {
+    return this.items[index];
+  }
+
+  registerDataChangeListener(listener: DataChangeListener): void {
+    if (this.listeners.indexOf(listener) < 0) {
+      this.listeners.push(listener);
+    }
+  }
+
+  unregisterDataChangeListener(listener: DataChangeListener): void {
+    const i: number = this.listeners.indexOf(listener);
+    if (i >= 0) {
+      this.listeners.splice(i, 1);
+    }
+  }
+
+  set(items: SessionInfo[]): void {
+    this.items = items;
+    for (let i = 0; i < this.listeners.length; i++) {
+      this.listeners[i].onDataReloaded();
+    }
+  }
+
+  count(): number {
+    return this.items.length;
+  }
 }
 
 @Entry
@@ -71,6 +110,14 @@ struct Index {
   @State viewH: number = 120;
   @State sw: number = 233;
   @State sh: number = 233;
+  @State pageVisible: boolean = true;
+  @State stopArmed: boolean = false;
+  @State pollDelay: number = 2000;
+  @State failCount: number = 0;
+  @State lastError: string = '';
+  @State modelPending: boolean = false;
+  @State currentSessionId: string = '';
+  @State notifyEnabled: string = '';
 
   private timer: number = -1;
   private lanTimer: number = -1;
@@ -81,6 +128,12 @@ struct Index {
   private histories: Map<string, DshEvent[]> = new Map<string, DshEvent[]>();
   private lastSaveAt: number = 0;
   private toastTimer: number = -1;
+  private stopTimer: number = -1;
+  private sessionSource: SessionDataSource = new SessionDataSource();
+  private sessionSig: string = '';
+  private lastRunning: boolean = false;
+  private lastPendingCount: number = 0;
+  private notifySeq: number = 0;
   private scroller: Scroller = new Scroller();
   private promptScroller: Scroller = new Scroller();
   private connectScroller: Scroller = new Scroller();
@@ -88,6 +141,8 @@ struct Index {
   private sessionsScroller: Scroller = new Scroller();
   private modelsScroller: Scroller = new Scroller();
   private settingsScroller: Scroller = new Scroller();
+  private menuScroller: Scroller = new Scroller();
+  private diagScroller: Scroller = new Scroller();
   private presets: Preset[] = [
     { label: '继续', text: '继续' },
     { label: '在干嘛', text: '现在在干什么？' },
@@ -104,11 +159,23 @@ struct Index {
     this.restore();
   }
 
+  onPageShow(): void {
+    this.pageVisible = true;
+  }
+
+  onPageHide(): void {
+    this.pageVisible = false;
+  }
+
   aboutToDisappear(): void {
     this.stopPolling();
     if (this.toastTimer >= 0) {
       clearTimeout(this.toastTimer);
       this.toastTimer = -1;
+    }
+    if (this.stopTimer >= 0) {
+      clearTimeout(this.stopTimer);
+      this.stopTimer = -1;
     }
   }
 
@@ -222,22 +289,36 @@ struct Index {
 
   private startPolling(): void {
     this.stopPolling();
+    this.pollDelay = 2000;
     this.poll();
-    this.timer = setInterval(() => {
-      this.poll();
-    }, 2000);
     this.startLanProbe();
   }
 
   private stopPolling(): void {
     if (this.timer >= 0) {
-      clearInterval(this.timer);
+      clearTimeout(this.timer);
       this.timer = -1;
     }
     if (this.lanTimer >= 0) {
       clearInterval(this.lanTimer);
       this.lanTimer = -1;
     }
+  }
+
+  // 失败次数越多等得越久，连上就立刻回到 2 秒，不再每 2 秒撞一次墙。
+  private schedulePoll(): void {
+    if (this.timer >= 0) {
+      clearTimeout(this.timer);
+    }
+    if (this.token === '' || this.server === '') {
+      this.timer = -1;
+      return;
+    }
+    const delay: number = this.pollDelay;
+    this.timer = setTimeout(() => {
+      this.timer = -1;
+      this.poll();
+    }, delay);
   }
 
   // 用外网时每 30 秒探一次内网，回到同一 Wi-Fi 就自动切回。
@@ -262,7 +343,11 @@ struct Index {
   }
 
   private async poll(): Promise<void> {
-    if (this.busy || this.changingSession || this.token === '' || this.server === '') {
+    if (this.token === '' || this.server === '') {
+      return;
+    }
+    if (this.busy || this.changingSession) {
+      this.schedulePoll();
       return;
     }
     const generation: number = this.requestGeneration;
@@ -272,14 +357,21 @@ struct Index {
       if (generation === this.requestGeneration && !this.changingSession) {
         this.apply(snap);
       }
+      this.failCount = 0;
+      this.pollDelay = 2000;
+      this.lastError = '';
     } catch (e) {
       if (generation === this.requestGeneration) {
         this.connected = false;
         this.status = 'offline';
+        this.lastError = this.errText(e);
+        this.failCount += 1;
+        this.pollDelay = Math.min(30000, 2000 * Math.pow(2, Math.min(4, this.failCount - 1)));
         this.failover();
       }
     } finally {
       this.busy = false;
+      this.schedulePoll();
     }
   }
 
@@ -375,7 +467,7 @@ struct Index {
       this.status = 'idle';
     }
     if (snap.sessions) {
-      this.sessions = snap.sessions;
+      this.syncSessions(snap.sessions);
     }
     if (snap.remote !== undefined && snap.remote !== '') {
       this.remoteUrl = snap.remote;
@@ -388,6 +480,10 @@ struct Index {
       this.selectionModel = snap.selection.model;
     }
     const nextSessionId: string = snap.selected === undefined ? '' : snap.selected.id;
+    if (nextSessionId !== this.currentSessionId) {
+      this.currentSessionId = nextSessionId;
+      this.sessionSource.set(this.sessions);
+    }
     if (this.feedSessionId !== '' && nextSessionId !== this.feedSessionId && this.events.length > 0) {
       this.saveHistory(this.feedSessionId, this.events);
     }
@@ -417,6 +513,44 @@ struct Index {
     if (pend.length === 0 && this.view === 'approval') {
       this.switchView('main');
     }
+    const running: boolean = this.status === 'running';
+    this.notifyTransitions(this.lastRunning, running, pend.length);
+    this.lastRunning = running;
+    this.lastPendingCount = pend.length;
+    if (running) {
+      this.modelPending = false;
+    }
+  }
+
+  // 只有页面不在前台时才发通知；正在看的时候系统会自己亮，不必再响一次。
+  private notifyTransitions(prevRunning: boolean, running: boolean, pendingCount: number): void {
+    if (this.pageVisible) {
+      return;
+    }
+    const name: string = this.title === '' ? 'DSH 手表' : this.title;
+    if (pendingCount > 0 && this.lastPendingCount === 0) {
+      this.pushNotification('等待你审批', name + ' 有新的操作请求');
+      return;
+    }
+    if (prevRunning && !running) {
+      this.pushNotification('回合结束', name + ' 已完成');
+    }
+  }
+
+  private pushNotification(title: string, text: string): void {
+    this.notifySeq += 1;
+    try {
+      notificationManager.publish({
+        id: 1000 + (this.notifySeq % 50),
+        content: {
+          notificationContentType: notificationManager.ContentType.NOTIFICATION_CONTENT_BASIC_TEXT,
+          normal: { title: title, text: text }
+        }
+      }).then(() => {
+      }, () => {
+      });
+    } catch (e) {
+    }
   }
 
   private scrollToBottom(): void {
@@ -433,6 +567,10 @@ struct Index {
     this.feedSessionId = '';
     this.events = [];
     this.lastSeq = -1;
+    this.sessions = [];
+    this.sessionSig = '';
+    this.currentSessionId = '';
+    this.sessionSource.set([]);
     this.stopPolling();
     this.token = '';
     this.server = '';
@@ -484,8 +622,9 @@ struct Index {
       if (r.ok === true) {
         this.selectionProvider = provider;
         this.selectionModel = model;
+        this.modelPending = true;
         this.showModels = false;
-        this.toast('已切换到下一请求');
+        this.toast('已切换，下一轮生效');
       } else {
         this.toast(r.error === undefined ? '切换失败' : r.error);
       }
@@ -517,6 +656,9 @@ struct Index {
     animateTo({ duration: 200, curve: Curve.EaseOut }, () => {
       this.view = v;
     });
+    if (v === 'diagnostics') {
+      this.refreshNotifyState();
+    }
     setTimeout(() => {
       try {
         this.getUIContext().getFocusController().requestFocus('crown-' + v);
@@ -684,9 +826,23 @@ struct Index {
     try {
       const r = await fetchSessions(this.server, this.token);
       if (r.sessions) {
-        this.sessions = r.sessions;
+        this.syncSessions(r.sessions);
       }
     } catch (e) {
+    }
+  }
+
+  // 会话列表每 2 秒都会到一份，签名没变就不重建，省掉整屏重排。
+  private syncSessions(list: SessionInfo[]): void {
+    this.sessions = list;
+    let sig: string = '';
+    for (let i = 0; i < list.length; i++) {
+      const s: SessionInfo = list[i];
+      sig += s.id + '|' + s.title + '|' + (s.running ? '1' : '0') + (s.live ? '1' : '0') + ';';
+    }
+    if (sig !== this.sessionSig) {
+      this.sessionSig = sig;
+      this.sessionSource.set(list);
     }
   }
 
@@ -716,6 +872,24 @@ struct Index {
   }
 
   private async doStop(): Promise<void> {
+    // 两段式：第一下只是亮个红，3 秒内再点才真的停，避免表冠误触。
+    if (!this.stopArmed) {
+      this.stopArmed = true;
+      this.toast('再点一次确认停止');
+      if (this.stopTimer >= 0) {
+        clearTimeout(this.stopTimer);
+      }
+      this.stopTimer = setTimeout(() => {
+        this.stopArmed = false;
+        this.stopTimer = -1;
+      }, 3000);
+      return;
+    }
+    this.stopArmed = false;
+    if (this.stopTimer >= 0) {
+      clearTimeout(this.stopTimer);
+      this.stopTimer = -1;
+    }
     try {
       await cancelTurn(this.server, this.token);
       this.toast('已请求停止');
@@ -740,6 +914,11 @@ struct Index {
   private errText(e: Object): string {
     const be = e as BusinessError;
     return be && be.message ? be.message : '未知错误';
+  }
+
+  private imageUrl(ev: DshEvent, index: number): string {
+    return this.server + '/api/image?token=' + encodeURIComponent(this.token) +
+      '&sessionId=' + encodeURIComponent(ev.sessionId) + '&seq=' + ev.seq + '&i=' + index;
   }
 
   private formatEvent(ev: DshEvent): string {
@@ -826,6 +1005,8 @@ struct Index {
         this.MenuView()
       } else if (this.view === 'settings') {
         this.SettingsView()
+      } else if (this.view === 'diagnostics') {
+        this.DiagnosticsView()
       } else {
         this.MainView()
       }
@@ -985,11 +1166,31 @@ struct Index {
               ListItem() {
                 Column() {
                   if (ev.kind === 'assistant' || ev.kind === 'user') {
-                    Text(this.formatEvent(ev))
-                      .fontSize(this.vp(10))
-                      .lineHeight(this.vp(14))
-                      .fontColor(ev.kind === 'user' ? '#D2EFE6' : TEXT)
+                    if ((ev.text === undefined ? '' : ev.text) !== '') {
+                      Text(this.formatEvent(ev))
+                        .fontSize(this.vp(10))
+                        .lineHeight(this.vp(14))
+                        .fontColor(ev.kind === 'user' ? '#D2EFE6' : TEXT)
+                        .width('100%')
+                    }
+                    if (ev.images !== undefined && ev.images.length > 0) {
+                      Row() {
+                        Image(this.imageUrl(ev, 0))
+                          .width(this.px(104))
+                          .height(this.px(78))
+                          .objectFit(ImageFit.Cover)
+                          .borderRadius(this.px(8))
+                          .margin({ top: this.px(4) })
+                        if (ev.images.length > 1) {
+                          Text('+' + (ev.images.length - 1))
+                            .fontSize(this.vp(8))
+                            .fontColor(DIM)
+                            .margin({ left: this.px(5), top: this.px(4) })
+                        }
+                      }
                       .width('100%')
+                      .alignItems(VerticalAlign.Top)
+                    }
                   } else {
                     Row() {
                       Text(this.formatEvent(ev))
@@ -1072,17 +1273,17 @@ struct Index {
           .accessibilityText('编辑指令')
           .clickEffect({ level: ClickEffectLevel.LIGHT })
           .onClick(() => { this.openPrompt(); })
-          Text('■')
-            .fontSize(this.vp(8))
-            .fontColor(BAD)
+          Text(this.stopArmed ? '确认' : '■')
+            .fontSize(this.stopArmed ? this.vp(7) : this.vp(8))
+            .fontColor(this.stopArmed ? '#FFFFFF' : BAD)
             .textAlign(TextAlign.Center)
-            .width(this.px(28))
+            .width(this.stopArmed ? this.px(34) : this.px(28))
             .height(this.px(28))
-            .backgroundColor('#282126')
-            .border({ width: 0.5, color: '#46F1ABA8' })
+            .backgroundColor(this.stopArmed ? '#7A2A2E' : '#282126')
+            .border({ width: 0.5, color: this.stopArmed ? '#B4585C' : '#46F1ABA8' })
             .borderRadius(this.px(14))
             .margin({ left: this.px(6) })
-            .accessibilityText('停止当前任务')
+            .accessibilityText(this.stopArmed ? '确认停止当前任务' : '停止当前任务')
             .clickEffect({ level: ClickEffectLevel.LIGHT })
             .onClick(() => { this.doStop(); })
         }
@@ -1091,9 +1292,11 @@ struct Index {
         .margin({ top: this.px(6) })
 
         Row() {
-          Text('模型 · ' + (this.selectionModel === '' ? '跟随默认' : this.selectionModel))
+          Text(this.modelPending
+            ? ('模型 · ' + (this.selectionModel === '' ? '默认' : this.selectionModel) + ' · 下轮生效')
+            : ('模型 · ' + (this.selectionModel === '' ? '跟随默认' : this.selectionModel)))
             .fontSize(this.vp(7))
-            .fontColor(this.selectionModel === '' ? DIM : ACCENT)
+            .fontColor(this.modelPending ? WARN : (this.selectionModel === '' ? DIM : ACCENT))
             .height(this.px(16))
             .padding({ left: this.px(11), right: this.px(11) })
             .textAlign(TextAlign.Center)
@@ -1361,29 +1564,35 @@ struct Index {
 
   @Builder
   MenuView() {
-    Column() {
-      Text('控制中心')
-        .id('crown-menu')
-        .fontSize(this.vp(13))
-        .fontWeight(FontWeight.Medium)
-        .fontColor(TEXT)
-        .focusable(true)
-        .focusOnTouch(true)
-        .defaultFocus(true)
-      this.MenuTile('会话', '回到正在进行的事', '≡', 'sessions')
-      this.MenuTile('设置', '连接与设备管理', '◇', 'settings')
-      Text('返回')
-        .fontSize(this.vp(9))
-        .fontColor(ACCENT)
-        .padding({ left: this.px(16), right: this.px(16), top: this.px(6), bottom: this.px(6) })
-        .margin({ top: this.px(5) })
-        .clickEffect({ level: ClickEffectLevel.LIGHT })
-        .onClick(() => { this.switchView('main'); })
+    Scroll(this.menuScroller) {
+      Column() {
+        Text('控制中心')
+          .id('crown-menu')
+          .fontSize(this.vp(13))
+          .fontWeight(FontWeight.Medium)
+          .fontColor(TEXT)
+          .focusable(true)
+          .focusOnTouch(true)
+          .defaultFocus(true)
+          .onDigitalCrown((event: CrownEvent) => { this.handleCrown(this.menuScroller, event); })
+        this.MenuTile('会话', '回到正在进行的事', '≡', 'sessions')
+        this.MenuTile('设置', '连接与设备管理', '◇', 'settings')
+        this.MenuTile('诊断', '连接、轮询与缓存', '◎', 'diagnostics')
+        Text('返回')
+          .fontSize(this.vp(9))
+          .fontColor(ACCENT)
+          .padding({ left: this.px(16), right: this.px(16), top: this.px(6), bottom: this.px(6) })
+          .margin({ top: this.px(5) })
+          .clickEffect({ level: ClickEffectLevel.LIGHT })
+          .onClick(() => { this.switchView('main'); })
+      }
+      .width('100%')
+      .padding({ left: this.px(43), right: this.px(43), top: this.px(37), bottom: this.px(34) })
     }
     .width('100%')
     .height('100%')
-    .padding({ left: this.px(43), right: this.px(43), top: this.px(37), bottom: this.px(34) })
-    .justifyContent(FlexAlign.Center)
+    .scrollBar(BarState.Off)
+    .edgeEffect(EdgeEffect.Spring)
   }
 
   @Builder
@@ -1550,6 +1759,147 @@ struct Index {
     })
   }
 
+  private linkText(): string {
+    if (this.netMode === 'lan') { return '内网 · 固定'; }
+    if (this.netMode === 'remote') { return '外网 · 固定'; }
+    return this.usingRemote ? '自动 · 当前外网' : '自动 · 当前内网';
+  }
+
+  private async refreshNotifyState(): Promise<void> {
+    try {
+      const enabled: boolean = await notificationManager.isNotificationEnabled();
+      this.notifyEnabled = enabled ? '已开启' : '未开启';
+    } catch (e) {
+      this.notifyEnabled = '未知';
+    }
+  }
+
+  private async requestNotify(): Promise<void> {
+    try {
+      await notificationManager.requestEnableNotification();
+      this.toast('通知已设置');
+    } catch (e) {
+      this.toast('去系统设置里开通知');
+    }
+    this.refreshNotifyState();
+  }
+
+  private async clearHistory(): Promise<void> {
+    this.histories.clear();
+    try {
+      const p = await preferences.getPreferences(this.ctx(), STORE);
+      const all = await p.getAll();
+      const keys: string[] = Object.keys(all);
+      for (let i = 0; i < keys.length; i++) {
+        if (keys[i].startsWith('hist_')) {
+          await p.delete(keys[i]);
+        }
+      }
+      await p.flush();
+    } catch (e) {
+    }
+    this.toast('本地缓存已清');
+  }
+
+  @Builder
+  DiagRow(label: string, value: string) {
+    Row() {
+      Text(label)
+        .fontSize(this.vp(8))
+        .fontColor(DIM)
+        .width(this.px(42))
+      Text(value === '' ? '—' : value)
+        .fontSize(this.vp(8))
+        .fontColor(TEXT)
+        .layoutWeight(1)
+        .textAlign(TextAlign.End)
+        .maxLines(2)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+    }
+    .width('100%')
+    .padding({ top: this.px(4), bottom: this.px(4) })
+  }
+
+  @Builder
+  DiagnosticsView() {
+    Scroll(this.diagScroller) {
+      Column() {
+        Text('诊断')
+          .id('crown-diagnostics')
+          .fontSize(this.vp(14))
+          .fontWeight(FontWeight.Medium)
+          .fontColor(TEXT)
+          .focusable(true)
+          .focusOnTouch(true)
+          .defaultFocus(true)
+          .onDigitalCrown((event: CrownEvent) => { this.handleCrown(this.diagScroller, event); })
+        Column() {
+          this.DiagRow('版本', '2.0.2')
+          this.DiagRow('地址', this.server)
+          this.DiagRow('链路', this.linkText())
+          this.DiagRow('状态', this.connected ? '在线' : '离线')
+          this.DiagRow('轮询', Math.round(this.pollDelay / 1000) + ' 秒')
+          this.DiagRow('失败', this.failCount + ' 次')
+          this.DiagRow('事件', this.events.length + ' 条')
+          this.DiagRow('会话', this.sessions.length + ' 个')
+          this.DiagRow('待审批', this.pending.length + ' 个')
+          this.DiagRow('通知', this.notifyEnabled)
+          this.DiagRow('外网', this.remoteUrl)
+          if (this.lastError !== '') {
+            this.DiagRow('最近错误', this.lastError)
+          }
+        }
+        .width('100%')
+        .padding({ left: this.px(12), right: this.px(12), top: this.px(6), bottom: this.px(6) })
+        .backgroundColor(CARD)
+        .border({ width: 0.5, color: HAIRLINE })
+        .borderRadius(this.px(14))
+        .margin({ top: this.px(12) })
+        Text('开启通知')
+          .fontSize(this.vp(9))
+          .fontColor(TEXT)
+          .textAlign(TextAlign.Center)
+          .width('100%')
+          .height(this.px(26))
+          .margin({ top: this.px(8) })
+          .backgroundColor('#23343A')
+          .border({ width: 0.5, color: HAIRLINE })
+          .borderRadius(this.px(13))
+          .clickEffect({ level: ClickEffectLevel.LIGHT })
+          .onClick(() => { this.requestNotify(); })
+        Text('清空本地缓存')
+          .fontSize(this.vp(9))
+          .fontColor(BAD)
+          .textAlign(TextAlign.Center)
+          .width('100%')
+          .height(this.px(28))
+          .margin({ top: this.px(9) })
+          .backgroundColor('#282126')
+          .border({ width: 0.5, color: '#38F1ABA8' })
+          .borderRadius(this.px(14))
+          .clickEffect({ level: ClickEffectLevel.LIGHT })
+          .onClick(() => { this.clearHistory(); })
+        Text('返回')
+          .fontSize(this.vp(9))
+          .fontColor(ACCENT)
+          .padding({ left: this.px(16), right: this.px(16), top: this.px(6), bottom: this.px(6) })
+          .margin({ top: this.px(5) })
+          .clickEffect({ level: ClickEffectLevel.LIGHT })
+          .onClick(() => { this.switchView('main'); })
+      }
+      .width('100%')
+      .padding({ left: this.px(40), right: this.px(40), top: this.px(34), bottom: this.px(30) })
+    }
+    .width('100%')
+    .height('100%')
+    .scrollBar(BarState.Off)
+    .edgeEffect(EdgeEffect.Spring)
+    .focusable(true)
+    .onDigitalCrown((event: CrownEvent) => {
+      this.handleCrown(this.diagScroller, event);
+    })
+  }
+
   @Builder
   SessionsView() {
     Column() {
@@ -1585,7 +1935,7 @@ struct Index {
       .padding({ left: this.px(40), right: this.px(40) })
       .margin({ top: this.px(35), bottom: this.px(5) })
       List({ scroller: this.sessionsScroller }) {
-        ForEach(this.sessions, (s: SessionInfo) => {
+        LazyForEach(this.sessionSource, (s: SessionInfo) => {
           ListItem() {
             Row() {
               Circle({ width: this.vp(4), height: this.vp(4) })
@@ -1611,8 +1961,8 @@ struct Index {
             }
             .width('100%')
             .padding({ left: this.px(10), right: this.px(10), top: this.px(9), bottom: this.px(9) })
-            .backgroundColor(CARD)
-            .border({ width: 0.5, color: HAIRLINE })
+            .backgroundColor(s.id === this.currentSessionId ? '#1B3339' : CARD)
+            .border({ width: 0.5, color: s.id === this.currentSessionId ? '#66ADE9D9' : HAIRLINE })
             .borderRadius(this.px(13))
           }
           .padding({ bottom: this.px(5) })
