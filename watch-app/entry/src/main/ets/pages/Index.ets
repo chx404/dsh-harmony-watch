@@ -11,6 +11,8 @@ import {
 } from '../common/Net';
 import { DshEvent, DshImage, ModelOption, PendingInfo, ProviderOption, SessionInfo, SimpleResult, StateSnapshot } from '../common/Types';
 import { reconcileEventFeed, visibleFeedEvents } from '../common/EventFeed';
+import { swiperProgress, indicatorTranslation } from '../common/SwiperProgress';
+import { QuickGuide } from '../common/QuickGuide';
 
 const STORE = 'dsh_watch';
 // Sea Glass：低饱和海盐绿，只给可操作元素和状态上色。
@@ -79,6 +81,8 @@ class SessionDataSource implements IDataSource {
 @Component
 struct Index {
   @State view: string = 'connect';
+  @State bootReady: boolean = false;
+  @State showGuide: boolean = false;
   @State server: string = '';
   @State primaryServer: string = '';
   @State remoteUrl: string = '';
@@ -121,6 +125,8 @@ struct Index {
   @State modelPending: boolean = false;
   @State modelsLoading: boolean = false;
   @State currentSessionId: string = '';
+  @State pageIndex: number = 1;
+  @State slidePos: number = 1;
   @State notifyEnabled: string = '';
   @State bgState: string = '未启动';
   @State imgFail: number = 0;
@@ -150,6 +156,7 @@ struct Index {
   private sessionsScroller: Scroller = new Scroller();
   private modelsScroller: Scroller = new Scroller();
   private settingsScroller: Scroller = new Scroller();
+  private swiper: SwiperController = new SwiperController();
   private menuScroller: Scroller = new Scroller();
   private diagScroller: Scroller = new Scroller();
   private presets: Preset[] = [
@@ -166,7 +173,6 @@ struct Index {
   aboutToAppear(): void {
     this.measure();
     this.restore();
-    this.ensureNotification();
   }
 
   onPageShow(): void {
@@ -327,8 +333,11 @@ struct Index {
   }
 
   private async restore(): Promise<void> {
+    // 默认展示，偏好读取失败也能离线跳过；等待读取完成前不闪现配对页。
+    this.showGuide = true;
     try {
       const p = await preferences.getPreferences(this.ctx(), STORE);
+      this.showGuide = (await p.get('guideSeenV1', false)) !== true;
       const s = await p.get('server', '');
       const t = await p.get('token', '');
       const sv: string = typeof s === 'string' ? s : '';
@@ -351,6 +360,22 @@ struct Index {
         this.startPolling();
       }
     } catch (e) {
+    } finally {
+      this.bootReady = true;
+      if (!this.showGuide) { this.ensureNotification(); }
+    }
+  }
+
+  private async finishGuide(): Promise<void> {
+    // 先关闭，再落盘。跳过和完成均不打断已有配对、会话与待审批状态。
+    this.showGuide = false;
+    this.ensureNotification();
+    try {
+      const p = await preferences.getPreferences(this.ctx(), STORE);
+      await p.put('guideSeenV1', true);
+      await p.flush();
+    } catch (e) {
+      this.toast('引导进度未保存，下次可能再次显示');
     }
   }
 
@@ -783,6 +808,14 @@ struct Index {
   }
 
   private switchView(v: string): void {
+    if (v === 'menu') {
+      this.goPage(0);
+      return;
+    }
+    if (v === 'main') {
+      this.goPage(1);
+      return;
+    }
     animateTo({ duration: 200, curve: Curve.EaseOut }, () => {
       this.view = v;
     });
@@ -795,6 +828,25 @@ struct Index {
       } catch (e) {
       }
     }, 120);
+  }
+
+  private goPage(index: number): void {
+    this.pageIndex = index;
+    this.view = 'main';
+    try {
+      this.swiper.changeIndex(index, true);
+    } catch (e) {
+    }
+    if (index === 2) {
+      this.refreshSessions();
+    }
+    setTimeout(() => {
+      try {
+        const id: string = index === 0 ? 'crown-menu' : (index === 2 ? 'crown-sessions' : 'crown-main');
+        this.getUIContext().getFocusController().requestFocus(id);
+      } catch (e) {
+      }
+    }, 160);
   }
 
   private edgeOpacity(idx: number): number {
@@ -890,6 +942,23 @@ struct Index {
         this.closePrompt();
         this.switchView('main');
         this.toast(mode === 'steer' ? '已插话' : '已排队');
+      } else {
+        this.toast(r.error === undefined ? '发送失败' : r.error);
+      }
+    } catch (e) {
+      this.toast('发送失败');
+    }
+  }
+
+  private async sendPreset(text: string): Promise<void> {
+    if (this.token === '') {
+      return;
+    }
+    try {
+      const r: SimpleResult = await sendPrompt(this.server, this.token, text, 'followup');
+      if (r.ok === true) {
+        this.goPage(1);
+        this.toast('已发送');
       } else {
         this.toast(r.error === undefined ? '发送失败' : r.error);
       }
@@ -1128,24 +1197,115 @@ struct Index {
     return '#0D151B';
   }
 
+  private pagePos(): number {
+    if (this.view === 'main') { return this.pageIndex; }
+    return -1;
+  }
+
+  @Builder
+  PageDots() {
+    Stack() {
+      Row() {
+        Text('')
+          .width(this.px(4))
+          .height(this.px(4))
+          .backgroundColor('#5E6E74')
+          .borderRadius(this.px(2))
+          .margin({ left: this.px(3), right: this.px(3) })
+        Text('')
+          .width(this.px(4))
+          .height(this.px(4))
+          .backgroundColor('#5E6E74')
+          .borderRadius(this.px(2))
+          .margin({ left: this.px(3), right: this.px(3) })
+        Text('')
+          .width(this.px(4))
+          .height(this.px(4))
+          .backgroundColor('#5E6E74')
+          .borderRadius(this.px(2))
+          .margin({ left: this.px(3), right: this.px(3) })
+      }
+      .height(this.px(4))
+      Text('')
+        .width(this.px(10))
+        .height(this.px(4))
+        .backgroundColor('#FFFFFF')
+        .borderRadius(this.px(2))
+        .position({ x: this.px(2), y: 0 })
+        .translate({ x: indicatorTranslation(this.slidePos, this.px(10)), y: 0 })
+    }
+    .width(this.px(34))
+    .height(this.px(4))
+  }
+
   build() {
     Stack({ alignContent: Alignment.Top }) {
-      if (this.view === 'connect') {
+      if (!this.bootReady) {
+        Column() {
+          Text('DSH')
+            .fontSize(this.vp(20))
+            .fontWeight(FontWeight.Bold)
+            .fontColor(ACCENT)
+        }
+        .width('100%')
+        .height('100%')
+        .justifyContent(FlexAlign.Center)
+      } else if (this.showGuide) {
+        QuickGuide({ screenWidth: this.sw, screenHeight: this.sh,
+          onFinish: () => { this.finishGuide(); } })
+      } else if (this.view === 'connect') {
         this.ConnectView()
       } else if (this.view === 'approval') {
         this.ApprovalView()
       } else if (this.view === 'sessions') {
         this.SessionsView()
-      } else if (this.view === 'menu') {
-        this.MenuView()
       } else if (this.view === 'settings') {
         this.SettingsView()
       } else if (this.view === 'diagnostics') {
         this.DiagnosticsView()
       } else {
-        this.MainView()
+        Column() {
+          Swiper(this.swiper) {
+            this.MenuView()
+            this.MainView()
+            this.QuickView()
+          }
+          .index(1)
+          .indicator(false)
+          .loop(false)
+          .cachedCount(1)
+          .onContentDidScroll((_selectedIndex: number, index: number, position: number, _mainAxisLength: number) => {
+            // 原生逐帧位置覆盖拖动、松手惯性、取消回弹和程序切页。
+            // 不依赖 selectedIndex，避免选中页变化或同帧多页回调造成反向/跳变。
+            this.slidePos = swiperProgress(index, position, 3);
+          })
+          .onAppear(() => {
+            // Swiper 离开主界面后会被销毁；重建的初始页是 .index(1)。
+            this.pageIndex = 1;
+            this.slidePos = 1;
+          })
+          .onChange((i: number) => {
+            this.pageIndex = i;
+            // 选中项事件不驱动白条，不能提前抢走尚未结束的原生动画。
+            if (i === 2) {
+              this.refreshSessions();
+            }
+          })
+          .layoutWeight(1)
+          .width('100%')
+
+          Row() {
+            this.PageDots()
+          }
+          .width('100%')
+          .height(this.px(14))
+          .justifyContent(FlexAlign.Center)
+          .margin({ top: this.px(1), bottom: this.px(2) })
+        }
+        .width('100%')
+        .height('100%')
       }
-      if (this.message !== '') {
+      if (this.message !== '' && this.bootReady && !this.showGuide) {
         Text(this.message)
           .fontSize(this.vp(9))
           .fontWeight(FontWeight.Medium)
@@ -1239,24 +1399,43 @@ struct Index {
   }
 
   @Builder
+  ChatBubble(ev: DshEvent) {
+    Column() {
+      if ((ev.text === undefined ? '' : ev.text) !== '') {
+        Text(ev.kind === 'user' ? (ev.text === undefined ? '' : ev.text) : this.formatEvent(ev))
+          .fontSize(this.vp(11))
+          .lineHeight(this.vp(16))
+          .fontColor(ev.kind === 'user' ? '#0C1B10' : TEXT)
+          .textAlign(TextAlign.Start)
+      }
+      if (ev.images !== undefined && ev.images.length > 0) {
+        Image(this.imageUrl(ev, 0))
+          .width(this.px(100))
+          .height(this.px(74))
+          .objectFit(ImageFit.Cover)
+          .borderRadius(this.px(8))
+          .margin({ top: this.px(3) })
+          .onError(() => { this.imgFail += 1; })
+        if (ev.images.length > 1) {
+          Text('+' + (ev.images.length - 1) + ' 张')
+            .fontSize(this.vp(7))
+            .fontColor(ev.kind === 'user' ? '#33501F' : DIM)
+            .margin({ top: this.px(2) })
+        }
+      }
+    }
+    .alignItems(ev.kind === 'user' ? HorizontalAlign.End : HorizontalAlign.Start)
+    .padding({ left: this.px(12), right: this.px(12), top: this.px(8), bottom: this.px(8) })
+    .backgroundColor(ev.kind === 'user' ? '#95EC69' : '#18242A')
+    .borderRadius(this.px(16))
+    .constraintSize({ maxWidth: this.px(172) })
+  }
+
+  @Builder
   MainView() {
     Stack({ alignContent: Alignment.Center }) {
       Column() {
         Row() {
-          Text('···')
-            .fontSize(this.vp(15))
-            .fontWeight(FontWeight.Medium)
-            .fontColor(TEXT)
-            .textAlign(TextAlign.Center)
-            .width(this.px(26))
-            .height(this.px(26))
-            .backgroundColor('#1DD5EFE9')
-            .border({ width: 0.5, color: '#3AD7F1EB' })
-            .borderRadius(this.px(13))
-            .margin({ right: this.px(8) })
-            .accessibilityText('打开菜单')
-            .clickEffect({ level: ClickEffectLevel.LIGHT })
-            .onClick(() => { this.switchView('menu'); })
           Text(this.title === '' ? 'DSH Watch' : this.title)
             .id('crown-main')
             .fontSize(this.vp(10))
@@ -1276,9 +1455,9 @@ struct Index {
             .margin({ left: this.px(7) })
         }
         .width('100%')
-        .height(this.px(30))
-        .padding({ left: this.px(13), right: this.px(13) })
-        .margin({ bottom: this.px(5) })
+        .height(this.px(26))
+        .padding({ left: this.px(44), right: this.px(44) })
+        .margin({ bottom: this.px(3) })
 
         List({ scroller: this.scroller }) {
           if (visibleFeedEvents(this.events).length === 0) {
@@ -1299,35 +1478,16 @@ struct Index {
           } else {
             ForEach(visibleFeedEvents(this.events), (ev: DshEvent, idx: number) => {
               ListItem() {
-                Column() {
-                  if (ev.kind === 'assistant' || ev.kind === 'user') {
-                    if ((ev.text === undefined ? '' : ev.text) !== '') {
-                      Text(this.formatEvent(ev))
-                        .fontSize(this.vp(10))
-                        .lineHeight(this.vp(14))
-                        .fontColor(ev.kind === 'user' ? '#D2EFE6' : TEXT)
-                        .width('100%')
-                    }
-                    if (ev.images !== undefined && ev.images.length > 0) {
-                      Row() {
-                        Image(this.imageUrl(ev, 0))
-                          .width(this.px(104))
-                          .height(this.px(78))
-                          .objectFit(ImageFit.Cover)
-                          .borderRadius(this.px(8))
-                          .margin({ top: this.px(4) })
-                          .onError(() => { this.imgFail += 1; })
-                        if (ev.images.length > 1) {
-                          Text('+' + (ev.images.length - 1))
-                            .fontSize(this.vp(8))
-                            .fontColor(DIM)
-                            .margin({ left: this.px(5), top: this.px(4) })
-                        }
-                      }
-                      .width('100%')
-                      .alignItems(VerticalAlign.Top)
-                    }
-                  } else {
+                if (ev.kind === 'user' || ev.kind === 'assistant') {
+                  Row() {
+                    this.ChatBubble(ev)
+                  }
+                  .width('100%')
+                  .justifyContent(ev.kind === 'user' ? FlexAlign.End : FlexAlign.Start)
+                  .padding({ left: this.px(4), right: this.px(4), top: this.px(3), bottom: this.px(3) })
+                  .opacity(1)
+                } else {
+                  Column() {
                     Row() {
                       Text(this.formatEvent(ev))
                         .fontSize(this.vp(9))
@@ -1352,14 +1512,13 @@ struct Index {
                         .margin({ top: this.px(4) })
                     }
                   }
+                  .width('100%')
+                  .padding({ left: this.px(10), right: this.px(10), top: this.px(6), bottom: this.px(6) })
+                  .margin({ left: this.px(6), right: this.px(6) })
+                  .backgroundColor('#0B1418')
+                  .borderRadius(this.px(12))
+                  .opacity(1)
                 }
-                .width('100%')
-                .padding({ left: this.px(8), right: this.px(8), top: this.px(4), bottom: this.px(4) })
-                .backgroundColor(this.eventSurface(ev))
-                .border({ width: 0.5, color: ev.kind === 'user' ? '#2BADDACD' : '#14C7D9E3' })
-                .borderRadius(this.px(10))
-                .opacity(this.edgeOpacity(idx))
-                .scale({ x: this.edgeScale(idx), y: this.edgeScale(idx) })
               }
             }, (ev: DshEvent) => ev.seq.toString())
           }
@@ -1403,8 +1562,8 @@ struct Index {
           .height(this.px(28))
           .layoutWeight(1)
           .padding({ left: this.px(11), right: this.px(9) })
-          .linearGradient({ angle: 110, colors: [['#29413F', 0], ['#182C32', 1]] })
-          .border({ width: 0.5, color: '#55BEE9DD' })
+          .backgroundColor('#0D181C')
+          .border({ width: 0.5, color: '#2A4046' })
           .borderRadius(this.px(14))
           .accessibilityText('编辑指令')
           .clickEffect({ level: ClickEffectLevel.LIGHT })
@@ -1424,8 +1583,8 @@ struct Index {
             .onClick(() => { this.doStop(); })
         }
         .width('100%')
-        .padding({ left: this.px(13), right: this.px(13) })
-        .margin({ top: this.px(6) })
+        .padding({ left: this.px(20), right: this.px(20) })
+        .margin({ top: this.px(7), bottom: this.px(2) })
 
         Row() {
           Text(this.modelPending
@@ -1445,10 +1604,11 @@ struct Index {
         .width('100%')
         .justifyContent(FlexAlign.Center)
         .margin({ top: this.px(3) })
+
       }
       .width('100%')
       .height('100%')
-      .padding({ left: this.px(24), right: this.px(24), top: this.px(30), bottom: this.px(24) })
+      .padding({ left: this.px(13), right: this.px(13), top: this.px(18), bottom: this.px(8) })
 
       if (this.showPrompt) {
         Stack() {
@@ -1610,6 +1770,63 @@ struct Index {
     }
     .width('100%')
     .height('100%')
+    
+  }
+
+  @Builder
+  QuickView() {
+    Scroll() {
+      Column() {
+        Text('快捷')
+          .id('crown-quick')
+          .fontSize(this.vp(13))
+          .fontWeight(FontWeight.Medium)
+          .fontColor(TEXT)
+          .focusable(true)
+          .focusOnTouch(true)
+          .defaultFocus(true)
+        Text('抬手就能派活')
+          .fontSize(this.vp(7))
+          .fontColor(DIM)
+          .margin({ top: this.px(2), bottom: this.px(10) })
+        ForEach(this.presets, (item: Preset) => {
+          Row() {
+            Text(item.label)
+              .fontSize(this.vp(11))
+              .fontColor(TEXT)
+            Blank()
+            Text('›')
+              .fontSize(this.vp(13))
+              .fontColor(DIM)
+          }
+          .width('100%')
+          .height(this.px(42))
+          .padding({ left: this.px(16), right: this.px(14) })
+          .backgroundColor('#0D181C')
+          .borderRadius(this.px(21))
+          .margin({ top: this.px(7) })
+          .clickEffect({ level: ClickEffectLevel.LIGHT })
+          .onClick(() => { this.sendPreset(item.text); })
+        }, (item: Preset) => item.label)
+        Row() {
+          Text('新建会话')
+            .fontSize(this.vp(10))
+            .fontColor(ACCENT)
+        }
+        .width('100%')
+        .height(this.px(36))
+        .justifyContent(FlexAlign.Center)
+        .margin({ top: this.px(6) })
+        .clickEffect({ level: ClickEffectLevel.LIGHT })
+        .onClick(() => { this.doNew(); })
+      }
+      .width('100%')
+      .padding({ left: this.px(30), right: this.px(30), top: this.px(30), bottom: this.px(30) })
+    }
+    .width('100%')
+    .height('100%')
+    .scrollBar(BarState.Off)
+    .edgeEffect(EdgeEffect.Spring)
   }
 
   @Builder
@@ -1671,10 +1888,14 @@ struct Index {
   MenuTile(label: string, caption: string, symbol: string, destination: string) {
     Row() {
       Text(symbol)
-        .fontSize(this.vp(13))
+        .fontSize(this.vp(12))
         .fontColor(ACCENT)
         .textAlign(TextAlign.Center)
-        .width(this.px(22))
+        .width(this.px(28))
+        .height(this.px(28))
+        .backgroundColor('#1B3335')
+        .borderRadius(this.px(14))
+        .margin({ right: this.px(9) })
       Column() {
         Text(label)
           .fontSize(this.vp(11))
@@ -1683,25 +1904,25 @@ struct Index {
         Text(caption)
           .fontSize(this.vp(7))
           .fontColor(DIM)
-          .margin({ top: this.px(2) })
+          .margin({ top: this.px(1) })
       }
       .alignItems(HorizontalAlign.Start)
       .layoutWeight(1)
-      .margin({ left: this.px(5) })
       Text('›')
-        .fontSize(this.vp(15))
+        .fontSize(this.vp(14))
         .fontColor(DIM)
+        .margin({ left: this.px(4) })
     }
     .width('100%')
-    .height(this.px(39))
-    .padding({ left: this.px(9), right: this.px(11) })
-    .linearGradient({ angle: 130, colors: [['#22363D', 0], ['#14212A', 1]] })
-    .border({ width: 0.5, color: HAIRLINE })
-    .borderRadius(this.px(15))
-    .margin({ top: this.px(8) })
+    .height(this.px(44))
+    .padding({ left: this.px(8), right: this.px(13) })
+    .backgroundColor('#0D181C')
+    .borderRadius(this.px(22))
+    .margin({ top: this.px(7) })
     .clickEffect({ level: ClickEffectLevel.LIGHT })
     .onClick(() => {
       if (destination === 'sessions') { this.openSessions(); }
+      else if (destination === 'guide') { this.showGuide = true; }
       else { this.switchView(destination); }
     })
   }
@@ -1722,13 +1943,7 @@ struct Index {
         this.MenuTile('会话', '回到正在进行的事', '≡', 'sessions')
         this.MenuTile('设置', '连接与设备管理', '◇', 'settings')
         this.MenuTile('诊断', '连接、轮询与缓存', '◎', 'diagnostics')
-        Text('返回')
-          .fontSize(this.vp(9))
-          .fontColor(ACCENT)
-          .padding({ left: this.px(16), right: this.px(16), top: this.px(6), bottom: this.px(6) })
-          .margin({ top: this.px(5) })
-          .clickEffect({ level: ClickEffectLevel.LIGHT })
-          .onClick(() => { this.switchView('main'); })
+        this.MenuTile('使用引导', '重新认识腕上 DSH', '?', 'guide')
       }
       .width('100%')
       .padding({ left: this.px(43), right: this.px(43), top: this.px(37), bottom: this.px(34) })
@@ -1737,6 +1952,7 @@ struct Index {
     .height('100%')
     .scrollBar(BarState.Off)
     .edgeEffect(EdgeEffect.Spring)
+    
   }
 
   @Builder
@@ -1978,7 +2194,7 @@ struct Index {
           .defaultFocus(true)
           .onDigitalCrown((event: CrownEvent) => { this.handleCrown(this.diagScroller, event); })
         Column() {
-          this.DiagRow('版本', '2.0.10')
+          this.DiagRow('版本', '2.0.38')
           this.DiagRow('地址', this.server)
           this.DiagRow('链路', this.linkText())
           this.DiagRow('内网候选', this.lanUrl)
@@ -2103,12 +2319,6 @@ struct Index {
           .accessibilityText('新建会话')
           .clickEffect({ level: ClickEffectLevel.LIGHT })
           .onClick(() => { this.doNew(); })
-        Text('返回')
-          .fontSize(this.vp(9))
-          .fontColor(DIM)
-          .padding({ left: this.px(4), right: this.px(4), top: this.px(6), bottom: this.px(6) })
-          .clickEffect({ level: ClickEffectLevel.LIGHT })
-          .onClick(() => { this.switchView('main'); })
       }
       .width('100%')
       .height(this.px(27))
@@ -2140,10 +2350,10 @@ struct Index {
                 .margin({ left: this.px(5) })
             }
             .width('100%')
-            .padding({ left: this.px(10), right: this.px(10), top: this.px(9), bottom: this.px(9) })
-            .backgroundColor(s.id === this.currentSessionId ? '#1B3339' : CARD)
-            .border({ width: 0.5, color: s.id === this.currentSessionId ? '#66ADE9D9' : HAIRLINE })
-            .borderRadius(this.px(13))
+            .padding({ left: this.px(11), right: this.px(12), top: this.px(10), bottom: this.px(10) })
+            .backgroundColor(s.id === this.currentSessionId ? '#16302F' : '#0D181C')
+            .border({ width: s.id === this.currentSessionId ? 1 : 0, color: '#66ADE9D9' })
+            .borderRadius(this.px(24))
           }
           .padding({ bottom: this.px(5) })
           .clickEffect({ level: ClickEffectLevel.LIGHT })
@@ -2159,5 +2369,6 @@ struct Index {
     }
     .width('100%')
     .height('100%')
+    
   }
 }
