@@ -2,6 +2,8 @@ import preferences from '@ohos.data.preferences';
 import common from '@ohos.app.ability.common';
 import display from '@ohos.display';
 import notificationManager from '@ohos.notificationManager';
+import backgroundTaskManager from '@ohos.resourceschedule.backgroundTaskManager';
+import wantAgent from '@ohos.app.ability.wantAgent';
 import { BusinessError } from '@ohos.base';
 import {
   cancelTurn, decideApproval, fetchEventDetail, fetchModels, fetchSessions, fetchState, newSession, ping,
@@ -111,13 +113,16 @@ struct Index {
   @State sw: number = 233;
   @State sh: number = 233;
   @State pageVisible: boolean = true;
+  @StorageLink('appInBackground') appInBackground: boolean = false;
   @State stopArmed: boolean = false;
   @State pollDelay: number = 2000;
   @State failCount: number = 0;
   @State lastError: string = '';
   @State modelPending: boolean = false;
+  @State modelsLoading: boolean = false;
   @State currentSessionId: string = '';
   @State notifyEnabled: string = '';
+  @State bgState: string = '未启动';
 
   private timer: number = -1;
   private lanTimer: number = -1;
@@ -134,6 +139,8 @@ struct Index {
   private lastRunning: boolean = false;
   private lastPendingCount: number = 0;
   private notifySeq: number = 0;
+  private bgRunning: boolean = false;
+  private delayId: number = -1;
   private scroller: Scroller = new Scroller();
   private promptScroller: Scroller = new Scroller();
   private connectScroller: Scroller = new Scroller();
@@ -157,18 +164,114 @@ struct Index {
   aboutToAppear(): void {
     this.measure();
     this.restore();
+    this.ensureNotification();
   }
 
   onPageShow(): void {
     this.pageVisible = true;
+    this.cancelDelay();
   }
 
   onPageHide(): void {
     this.pageVisible = false;
+    // 穿戴设备不给长时任务（9800005），退而求其次：申请系统延迟挂起，
+    // 通常能多撑几分钟，足够一轮对话跑完。
+    this.requestDelay();
+  }
+
+  private async requestDelay(): Promise<void> {
+    if (this.delayId >= 0) {
+      return;
+    }
+    try {
+      const info = await backgroundTaskManager.requestSuspendDelay('DSH 保持连接', () => {
+        this.delayId = -1;
+        this.bgState = '延迟到期';
+      });
+      this.delayId = info.requestId;
+      this.bgState = '延迟 ' + Math.round(info.actualDelayTime / 1000) + ' 秒';
+    } catch (e) {
+      this.bgState = '延迟失败';
+    }
+  }
+
+  private cancelDelay(): void {
+    if (this.delayId < 0) {
+      return;
+    }
+    try {
+      backgroundTaskManager.cancelSuspendDelay(this.delayId);
+    } catch (e) {
+    }
+    this.delayId = -1;
+    this.bgState = '前台';
+  }
+
+  private testNotify(): void {
+    this.pushNotification('DSH 测试', '通知通道正常');
+    this.toast('已发测试通知');
+  }
+
+  private async ensureNotification(): Promise<void> {
+    try {
+      const enabled: boolean = await notificationManager.isNotificationEnabled();
+      this.notifyEnabled = enabled ? '已开启' : '未开启';
+      if (!enabled) {
+        await notificationManager.requestEnableNotification();
+        this.notifyEnabled = '已开启';
+      }
+    } catch (e) {
+    }
+  }
+
+  private async startBackground(): Promise<void> {
+    if (this.bgRunning) {
+      return;
+    }
+    // 手表允许的后台模式因机型而异：先数据同步，不行再试音频播放。
+    const modes: backgroundTaskManager.BackgroundMode[] = [
+      backgroundTaskManager.BackgroundMode.DATA_TRANSFER,
+      backgroundTaskManager.BackgroundMode.AUDIO_PLAYBACK
+    ];
+    const labels: string[] = ['数据', '音频'];
+    const errors: string[] = [];
+    for (let i = 0; i < modes.length; i++) {
+      try {
+        const info: wantAgent.WantAgentInfo = {
+          wants: [{ bundleName: 'com.dsh.watchharmony', abilityName: 'EntryAbility' }],
+          actionType: wantAgent.OperationType.START_ABILITY,
+          requestCode: 0,
+          actionFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
+        };
+        const agent = await wantAgent.getWantAgent(info);
+        await backgroundTaskManager.startBackgroundRunning(this.ctx(), modes[i], agent);
+        this.bgRunning = true;
+        this.bgState = i === 0 ? '运行中' : '运行中·音频';
+        return;
+      } catch (e) {
+        const be = e as BusinessError;
+        const code: string = be !== undefined && be.code !== undefined ? String(be.code) : '?';
+        errors.push(labels[i] + ' ' + code);
+      }
+    }
+    this.bgRunning = false;
+    this.bgState = '失败 ' + errors.join(' / ');
+  }
+
+  private async stopBackground(): Promise<void> {
+    if (!this.bgRunning) {
+      return;
+    }
+    try {
+      await backgroundTaskManager.stopBackgroundRunning(this.ctx());
+    } catch (e) {
+    }
+    this.bgRunning = false;
   }
 
   aboutToDisappear(): void {
     this.stopPolling();
+    this.stopBackground();
     if (this.toastTimer >= 0) {
       clearTimeout(this.toastTimer);
       this.toastTimer = -1;
@@ -524,7 +627,8 @@ struct Index {
 
   // 只有页面不在前台时才发通知；正在看的时候系统会自己亮，不必再响一次。
   private notifyTransitions(prevRunning: boolean, running: boolean, pendingCount: number): void {
-    if (this.pageVisible) {
+    // 页面可见且应用在前台才不打扰；息屏时页面回调可能漏，Ability 的前后台更可靠。
+    if (this.pageVisible && !this.appInBackground) {
       return;
     }
     const name: string = this.title === '' ? 'DSH 手表' : this.title;
@@ -604,15 +708,23 @@ struct Index {
   }
 
   private async openModels(): Promise<void> {
-    this.showModels = true;
+    if (this.showModels) {
+      return;
+    }
+    this.modelsLoading = true;
+    animateTo({ duration: 260, curve: Curve.FastOutSlowIn }, () => {
+      this.showModels = true;
+    });
     setTimeout(() => {
       try { this.getUIContext().getFocusController().requestFocus('crown-models'); } catch (e) { }
-    }, 120);
+    }, 150);
     try {
       const catalog = await fetchModels(this.server, this.token, this.feedSessionId);
       if (catalog.ok === true) { this.modelOptions = catalog.providers; }
     } catch (e) {
       this.toast('模型列表读取失败');
+    } finally {
+      this.modelsLoading = false;
     }
   }
 
@@ -623,7 +735,7 @@ struct Index {
         this.selectionProvider = provider;
         this.selectionModel = model;
         this.modelPending = true;
-        this.showModels = false;
+        this.closeModels();
         this.toast('已切换，下一轮生效');
       } else {
         this.toast(r.error === undefined ? '切换失败' : r.error);
@@ -634,10 +746,15 @@ struct Index {
   }
 
   private closeModels(): void {
-    this.showModels = false;
+    if (!this.showModels) {
+      return;
+    }
+    animateTo({ duration: 200, curve: Curve.EaseIn }, () => {
+      this.showModels = false;
+    });
     setTimeout(() => {
       try { this.getUIContext().getFocusController().requestFocus('crown-main'); } catch (e) { }
-    }, 120);
+    }, 240);
   }
 
   private openPrompt(): void {
@@ -1419,6 +1536,14 @@ struct Index {
             }
             .width('100%')
             .height(this.px(22))
+            if (this.modelsLoading && this.modelOptions.length === 0) {
+              Text('读取中…')
+                .fontSize(this.vp(9))
+                .fontColor(DIM)
+                .width('100%')
+                .textAlign(TextAlign.Center)
+                .margin({ top: this.px(24) })
+            }
             List({ scroller: this.modelsScroller }) {
               ForEach(this.modelOptions, (p: ProviderOption) => {
                 ForEach(p.models, (m: ModelOption) => {
@@ -1457,7 +1582,7 @@ struct Index {
           .linearGradient({ angle: 145, colors: [['#F32A4144', 0], ['#F2112029', 1]] })
           .borderRadius(this.px(20))
           .border({ width: 0.5, color: '#66C2E5DA' })
-          .transition(TransitionEffect.scale({ x: 0.94, y: 0.94 }).combine(TransitionEffect.OPACITY))
+          .transition(TransitionEffect.scale({ x: 0.88, y: 0.88 }).combine(TransitionEffect.OPACITY))
         }
         .width('100%')
         .height('100%')
@@ -1834,9 +1959,10 @@ struct Index {
           .defaultFocus(true)
           .onDigitalCrown((event: CrownEvent) => { this.handleCrown(this.diagScroller, event); })
         Column() {
-          this.DiagRow('版本', '2.0.2')
+          this.DiagRow('版本', '2.0.8')
           this.DiagRow('地址', this.server)
           this.DiagRow('链路', this.linkText())
+          this.DiagRow('内网候选', this.lanUrl)
           this.DiagRow('状态', this.connected ? '在线' : '离线')
           this.DiagRow('轮询', Math.round(this.pollDelay / 1000) + ' 秒')
           this.DiagRow('失败', this.failCount + ' 次')
@@ -1844,6 +1970,7 @@ struct Index {
           this.DiagRow('会话', this.sessions.length + ' 个')
           this.DiagRow('待审批', this.pending.length + ' 个')
           this.DiagRow('通知', this.notifyEnabled)
+          this.DiagRow('后台', this.bgState)
           this.DiagRow('外网', this.remoteUrl)
           if (this.lastError !== '') {
             this.DiagRow('最近错误', this.lastError)
@@ -1855,6 +1982,18 @@ struct Index {
         .border({ width: 0.5, color: HAIRLINE })
         .borderRadius(this.px(14))
         .margin({ top: this.px(12) })
+        Text('测试通知')
+          .fontSize(this.vp(9))
+          .fontColor(TEXT)
+          .textAlign(TextAlign.Center)
+          .width('100%')
+          .height(this.px(26))
+          .margin({ top: this.px(8) })
+          .backgroundColor('#23343A')
+          .border({ width: 0.5, color: HAIRLINE })
+          .borderRadius(this.px(13))
+          .clickEffect({ level: ClickEffectLevel.LIGHT })
+          .onClick(() => { this.testNotify(); })
         Text('开启通知')
           .fontSize(this.vp(9))
           .fontColor(TEXT)

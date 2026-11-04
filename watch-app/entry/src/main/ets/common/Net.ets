@@ -45,10 +45,14 @@ export function normalizeUrl(raw: string): string {
   return h;
 }
 
+// 宿主靠这个头记住手表版本，排查时能直接看出装的哪一版。
+const APP_VERSION = '2.0.8';
+
 function buildHeader(token: string): Record<string, string> {
   const h: Record<string, string> = {
     'Content-Type': 'application/json',
-    'x-dsh-watch-token': token
+    'x-dsh-watch-token': token,
+    'x-dsh-watch-version': APP_VERSION
   };
   return h;
 }

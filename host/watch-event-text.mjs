@@ -11,7 +11,11 @@ export function messageBody(message) {
     }
   };
   visit(message?.content);
-  return out.join('\n');
+  // 聊天里的表情图是 ![😉](http://127.0.0.1:3080/...) 这种本机 markdown 图片，
+  // 手表连不到那个地址也画不了；留表情字符本身更清楚。
+  return out.join('\n')
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/!\[([^\]]*)\]/g, '$1');
 }
 
 // 图片块只带元数据（附件 id / 尺寸），真正的字节由 /api/image 按需取。

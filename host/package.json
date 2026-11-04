@@ -1,6 +1,6 @@
 {
   "name": "dsh-harmony-watch",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "把手表/手机接到电脑上的 DeepSeek Harness：局域网自动发现 + 6 位码配对，实时看模型动作、远程发指令、手表上审批提权，支持外网隧道。",
   "license": "MIT",
   "type": "module",

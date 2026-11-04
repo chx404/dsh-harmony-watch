@@ -6,7 +6,7 @@
 - **审批**：`ctx.on('approval/request', …, { prepend: true })`，手表在线时抢在 Web UI 之前接管；
   手表离线 / 超时 / 回合取消 → 交还下一条应答者，不会把回合卡死；
 - **事件**：`ctx.on('session/event')` 把 `tool/call`、`tool/result`、`assistant/message`、`turn/*`、
-  `session/title` 归一化后推给手表；监听器全部带 guard，异常只记日志不外抛；
+  `session/title` 归一化后推给手表；图片块只带附件 id 与尺寸，正文由 `/api/image` 按需读取；监听器全部带 guard，异常只记日志不外抛；
 - **指令**：`agent.followup()`（排队下一轮）/ `agent.steer()`（插入当前回合下一步）；
 - **会话**：`/api/sessions` 列出实时 + 持久化会话，`/api/new` 新建，`/api/select` 切到冷会话时
   用 `agentPresets.resolve/mount` + `agents.resume` 按需恢复。
@@ -22,6 +22,9 @@
 ## 接口
 
 见仓库根 [README](../README.md#五http-接口自测--二次开发)。
+
+图片：`GET /api/image?token=<token>&sessionId=<id>&seq=<事件序号>&i=<第几张>`，返回原图字节；
+拿不到附件（内存后端 / 已 offload）时返回 404，手表显示占位。
 
 ## 兼容性
 

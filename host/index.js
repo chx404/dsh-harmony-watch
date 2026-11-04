@@ -27,7 +27,7 @@ import { ensureBinary, binaryPath, findFrpc } from './watch-tunnel-bin.mjs'
 
 export const name = 'dsh-harmony-watch'
 
-const VERSION = '2.0.1'
+const VERSION = '2.0.2'
 const RING_MAX = 400
 const TOKEN_HEADER = 'x-dsh-watch-token'
 
@@ -234,6 +234,8 @@ export function apply(ctx, config) {
     pending: new Map(), // approvalId -> {id,sessionId,tool,reason,preview,expiresAt,resolve,timer}
     subscribers: new Set(), // {res,sessionId}
     handles: new Map(), // sessionId -> AgentHandle（本插件 resume/create 出来的）
+    lastSeenAt: 0, // 最近一次带令牌的请求：手表是轮询的，不建 SSE
+    watchVersion: '', // 手表自己上报的版本号
   }
 
   const maxText = Number(cfg.maxText) || 400
@@ -884,6 +886,11 @@ ${(typeof tunnelState !== 'undefined' && tunnelState.url)
     if (state.events.length > RING_MAX) state.events.splice(0, state.events.length - RING_MAX)
   }
 
+  // 手表每 2 秒 GET /api/state，没有 SSE 连接；离线判定看最近一次鉴权请求。
+  function watchOnline() {
+    return state.lastSeenAt > 0 && nowMs() - state.lastSeenAt < 20000
+  }
+
   // ---- SSE ----------------------------------------------------------------
   function broadcast(item) {
     if (state.subscribers.size === 0) return
@@ -1016,8 +1023,8 @@ ${(typeof tunnelState !== 'undefined' && tunnelState.url)
         const reason = oneLine(req.reason ?? '')
         const timeoutMs = Math.max(5000, Number(cfg.approvalTimeoutMs) || 60000)
 
-        // 没有手表连着 → 不拦，Web UI 照常弹窗。
-        if (state.subscribers.size === 0) {
+        // 手表没在轮询 → 不拦，Web UI 照常弹窗。
+        if (!watchOnline()) {
           push({ sessionId: session.id, kind: 'approval-missed', tool, reason, text: '手表未连接，转交 Web UI' })
           return next()
         }
@@ -1528,6 +1535,11 @@ ${(typeof tunnelState !== 'undefined' && tunnelState.url)
         sessions: state.sessions.size,
         running: [...state.sessions.values()].some((item) => item.running),
         approvalMode: String(cfg.approvalMode),
+        watch: {
+          version: state.watchVersion,
+          lastSeenMsAgo: state.lastSeenAt > 0 ? nowMs() - state.lastSeenAt : -1,
+          online: watchOnline(),
+        },
       })
     }
 
@@ -1549,6 +1561,9 @@ ${(typeof tunnelState !== 'undefined' && tunnelState.url)
     if (token !== settings.token) {
       return sendJson(res, 401, { ok: false, error: 'unauthorized' })
     }
+    state.lastSeenAt = nowMs()
+    const watchVersion = req.headers['x-dsh-watch-version']
+    if (typeof watchVersion === 'string' && watchVersion !== '') state.watchVersion = watchVersion
 
     if (req.method === 'GET' && path === '/api/state') {
       return sendJson(res, 200, snapshot())
