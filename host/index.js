@@ -273,6 +273,23 @@ export function apply(ctx, config) {
     return pairState.code
   }
 
+  function attachmentPath(ref) {
+    try {
+      const fromService = ctx.get('attachment')?.imageHostPath?.(ref)
+      if (typeof fromService === 'string' && fromService !== '' && existsSync(fromService)) {
+        return fromService
+      }
+    } catch {
+      /* 没有 attachment 服务就走兜底 */
+    }
+    const id = String(ref?.attachmentId ?? '')
+    if (!id.startsWith('sha256:')) return ''
+    const hash = id.slice('sha256:'.length)
+    if (!/^[a-f0-9]{64}$/.test(hash)) return ''
+    const file = join(dshHome(), 'attachments', 'v1', 'objects', hash.slice(0, 2), hash)
+    return existsSync(file) ? file : ''
+  }
+
   function lanAddresses() {
     const out = []
     try {
@@ -1590,19 +1607,30 @@ ${(typeof tunnelState !== 'undefined' && tunnelState.url)
     }
 
     if (req.method === 'GET' && path === '/api/image') {
+      // 优先按附件 id 取（事件滚出缓存也能看）；老客户端还传 sessionId/seq/i。
+      const direct = String(url.searchParams.get('id') ?? '')
       const seq = Number(url.searchParams.get('seq'))
       const sessionId = url.searchParams.get('sessionId') ?? ''
       const index = Number(url.searchParams.get('i') ?? 0)
-      const event = state.events.find(item => item.seq === seq && item.sessionId === sessionId)
-      const ref = Array.isArray(event?.images) ? event.images[index] : undefined
-      if (!ref) return sendJson(res, 404, { ok: false, error: '图片不在缓存里' })
-      let file = ''
-      try {
-        file = ctx.get('attachment')?.imageHostPath?.(ref) ?? ''
-      } catch {
-        file = ''
+      let ref
+      if (direct !== '') {
+        ref = { attachmentId: direct, mediaType: url.searchParams.get('type') || 'image/jpeg' }
+      } else {
+        const event = state.events.find(item => item.seq === seq && item.sessionId === sessionId)
+        ref = Array.isArray(event?.images) ? event.images[index] : undefined
       }
-      if (!file || !existsSync(file)) return sendJson(res, 404, { ok: false, error: '原图已不可用' })
+      if (!ref) return sendJson(res, 404, { ok: false, error: '图片不在缓存里' })
+      // 先问 attachment 服务要路径；拿不到就按内容寻址布局兜底
+      // （sha256:<hash> → $DSH_HOME/attachments/v1/objects/<前两位>/<hash>）。
+      let file = attachmentPath(ref)
+      if (!file) {
+        return sendJson(res, 404, {
+          ok: false,
+          error: '原图已不可用',
+          home: dshHome(),
+          id: String(ref?.attachmentId ?? '').slice(0, 20),
+        })
+      }
       let data
       try {
         data = readFileSync(file)

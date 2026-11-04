@@ -123,6 +123,8 @@ struct Index {
   @State currentSessionId: string = '';
   @State notifyEnabled: string = '';
   @State bgState: string = '未启动';
+  @State imgFail: number = 0;
+  @State testImgUrl: string = '';
 
   private timer: number = -1;
   private lanTimer: number = -1;
@@ -205,6 +207,17 @@ struct Index {
     }
     this.delayId = -1;
     this.bgState = '前台';
+  }
+
+  private testImageLoad(): void {
+    const withImage = this.events.slice().reverse()
+      .find((ev: DshEvent) => ev.images !== undefined && ev.images.length > 0);
+    if (withImage === undefined) {
+      this.toast('当前会话没有图片');
+      return;
+    }
+    this.testImgUrl = this.imageUrl(withImage, 0) + '&t=' + Date.now().toString();
+    this.toast('正在加载');
   }
 
   private testNotify(): void {
@@ -1034,8 +1047,13 @@ struct Index {
   }
 
   private imageUrl(ev: DshEvent, index: number): string {
+    const img: DshImage | undefined = ev.images === undefined ? undefined : ev.images[index];
+    if (img === undefined) {
+      return '';
+    }
+    // 按附件 id 取：事件滚出宿主缓存后图还在。
     return this.server + '/api/image?token=' + encodeURIComponent(this.token) +
-      '&sessionId=' + encodeURIComponent(ev.sessionId) + '&seq=' + ev.seq + '&i=' + index;
+      '&id=' + encodeURIComponent(img.attachmentId) + '&type=' + encodeURIComponent(img.mediaType);
   }
 
   private formatEvent(ev: DshEvent): string {
@@ -1298,6 +1316,7 @@ struct Index {
                           .objectFit(ImageFit.Cover)
                           .borderRadius(this.px(8))
                           .margin({ top: this.px(4) })
+                          .onError(() => { this.imgFail += 1; })
                         if (ev.images.length > 1) {
                           Text('+' + (ev.images.length - 1))
                             .fontSize(this.vp(8))
@@ -1959,7 +1978,7 @@ struct Index {
           .defaultFocus(true)
           .onDigitalCrown((event: CrownEvent) => { this.handleCrown(this.diagScroller, event); })
         Column() {
-          this.DiagRow('版本', '2.0.8')
+          this.DiagRow('版本', '2.0.10')
           this.DiagRow('地址', this.server)
           this.DiagRow('链路', this.linkText())
           this.DiagRow('内网候选', this.lanUrl)
@@ -1971,6 +1990,7 @@ struct Index {
           this.DiagRow('待审批', this.pending.length + ' 个')
           this.DiagRow('通知', this.notifyEnabled)
           this.DiagRow('后台', this.bgState)
+          this.DiagRow('图片失败', this.imgFail + ' 次')
           this.DiagRow('外网', this.remoteUrl)
           if (this.lastError !== '') {
             this.DiagRow('最近错误', this.lastError)
@@ -1982,6 +2002,27 @@ struct Index {
         .border({ width: 0.5, color: HAIRLINE })
         .borderRadius(this.px(14))
         .margin({ top: this.px(12) })
+        Text('测试图片')
+          .fontSize(this.vp(9))
+          .fontColor(TEXT)
+          .textAlign(TextAlign.Center)
+          .width('100%')
+          .height(this.px(26))
+          .margin({ top: this.px(8) })
+          .backgroundColor('#23343A')
+          .border({ width: 0.5, color: HAIRLINE })
+          .borderRadius(this.px(13))
+          .clickEffect({ level: ClickEffectLevel.LIGHT })
+          .onClick(() => { this.testImageLoad(); })
+        if (this.testImgUrl !== '') {
+          Image(this.testImgUrl)
+            .width(this.px(96))
+            .height(this.px(72))
+            .objectFit(ImageFit.Cover)
+            .borderRadius(this.px(10))
+            .margin({ top: this.px(8) })
+            .onError(() => { this.imgFail += 1; this.toast('测试图加载失败'); })
+        }
         Text('测试通知')
           .fontSize(this.vp(9))
           .fontColor(TEXT)
