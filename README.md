@@ -1,18 +1,18 @@
 # dsh-harmony-watch
 
-在鸿蒙手表上遥控 DeepSeek Harness（DSH）的轻量客户端：看模型动作、发指令、审批提权、切会话、切模型、看图片消息。手表走 HTTP 轮询，手机或电脑跑一个 DSH 插件做桥。
+在鸿蒙手表上遥控 DeepSeek Harness（DSH）的轻量客户端：看模型动作、发指令、审批提权、切会话、切模型、看图片消息。首次打开有五页上手引导，手表走 HTTP 轮询，手机或电脑跑一个 DSH 插件做桥。
 
-> A HarmonyOS watch remote for DeepSeek Harness: live tool stream, prompts, approvals, session and model switching.
+> A HarmonyOS watch remote for DeepSeek Harness: live tool stream, prompts, approvals, session and model switching, with a built-in first-run guide. The watch talks to a small DSH plugin over HTTP.
 
 > **关于作者**
 >
 > 这个项目由一名初三学生利用课余时间、在 AI 辅助下完成。能力和时间都有限，难免有粗糙或者没考虑到的地方，请多包涵。遇到问题欢迎提 issue，我会尽量修。
- The watch talks to a small DSH plugin over HTTP.
 
 ## 组成
 
 ```
 鸿蒙手表 App ──HTTP/轮询──▶ dsh-harmony-watch 插件（跑在 DSH 进程里）
+                              ├── 6 位配对码（24 小时有效）
                               ├── 审批转发（先于 Web UI）
                               ├── 工具/回复事件流
                               ├── 指令下发（followup / steer）
@@ -46,9 +46,13 @@ powershell -File scripts/install.ps1 web   # Windows
 
 手表连接页填地址和配对码，配对码一天内有效。
 
+手表第一次启动会先显示五页引导，讲完再进配对页；不想看可以直接「跳过」，之后在「菜单 → 使用引导」里还能重看。
+
 ## 手表端功能
 
-- **会话流**：文字回复完整显示；工具调用、执行结果收成一行，点开看完整参数/输出
+- **上手引导**：第一次打开时自动进入，五页讲清配对、左右切屏、发指令、审批和停止；可以跳过，之后从「菜单 → 使用引导」重看
+- **三屏滑动**：菜单 / 对话 / 快捷三页横向切换，底部指示条跟着手指连续走，松手后的惯性段也同步，不会等页面停稳才补一下
+- **会话流**：文字回复完整显示；工具调用、执行结果收成一行，点开看完整参数/输出；消息按左右气泡分列
 - **图片消息（实验性）**：宿主会把图片元数据推给手表，但手表端渲染还没调通，目前可能看不到；文字消息、表情字符正常
 - **审批**：主机请求提权时自动切到审批页，允许 / 拒绝；超时交还电脑
 - **模型切换**：列表按服务商分组，切换后提示「下一轮生效」
@@ -104,6 +108,7 @@ powershell -File scripts/install.ps1 web   # Windows
 - 审批卡片只展示工具名和原因摘要
 - 穿戴设备不支持长时后台任务（`startBackgroundRunning` 返回 9800005），退后台后靠系统「延迟挂起」维持轮询，额度（通常几分钟）用完会暂停；长时间离开手表时通知可能收不到
 - 后台通知还依赖系统允许通知，手表开了勿扰也不会响
+- 引导的「已看过」标记存在手表本地偏好里，清除应用数据后会再出现一次
 - 手表需侧载，签名和安装流程因设备而异
 
 ## License
