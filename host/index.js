@@ -23,11 +23,12 @@ import { homedir, hostname, networkInterfaces } from 'node:os'
 import { join } from 'node:path'
 import { messageBody, messageImages, argumentsBody, publicEvent } from './watch-event-text.mjs'
 import { createWatchModelControl } from './watch-model-control.mjs'
+import { createDirectProvision } from './watch-direct-config.mjs'
 import { ensureBinary, binaryPath, findFrpc } from './watch-tunnel-bin.mjs'
 
 export const name = 'dsh-harmony-watch'
 
-const VERSION = '2.0.2'
+const VERSION = '2.1.0'
 const RING_MAX = 400
 const TOKEN_HEADER = 'x-dsh-watch-token'
 
@@ -1808,8 +1809,14 @@ ${(typeof tunnelState !== 'undefined' && tunnelState.url)
     return sendJson(res, 404, { ok: false, error: 'not found' })
   }
 
+  const directProvision = createDirectProvision({ getToken: () => settings.token, publicOrigin: cfg.remoteUrl, getPublicOrigin: () => tunnelState.url })
   const server = createServer((req, res) => {
     const url = new URL(req.url || '/', 'http://localhost')
+    // 独立配置页必须先于通用 CORS；秘密只走短期内存通道，不接入 state/SSE。
+    if (directProvision.matches(url.pathname)) {
+      void directProvision.handle(req, res, url)
+      return
+    }
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
@@ -1882,6 +1889,7 @@ ${(typeof tunnelState !== 'undefined' && tunnelState.url)
       if (entry.timer) clearTimeout(entry.timer)
     }
     state.pending.clear()
+    directProvision.dispose()
     server.close()
     stopTunnel()
     if (discoverySocket) {

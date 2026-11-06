@@ -13,6 +13,15 @@ import { DshEvent, DshImage, ModelOption, PendingInfo, ProviderOption, SessionIn
 import { reconcileEventFeed, visibleFeedEvents } from '../common/EventFeed';
 import { swiperProgress, indicatorTranslation } from '../common/SwiperProgress';
 import { QuickGuide } from '../common/QuickGuide';
+import { CrownMenu, CrownMenuItem } from '../common/CrownMenu';
+import { LocalChat } from '../common/LocalChat';
+import { DirectApiConfig } from '../common/DirectApi';
+import { ApiProfile } from '../common/ApiProfiles';
+import { LocalSession } from '../common/LocalSessions';
+import { LocalChatController } from '../common/LocalChatController';
+import { ViewHistory, WatchLocation, isWatchBackSwipe } from '../common/ViewHistory';
+import { CrownElastic } from '../common/CrownElastic';
+import { ChatChromeController } from '../common/ChatImmersion';
 
 const STORE = 'dsh_watch';
 // Sea Glass：低饱和海盐绿，只给可操作元素和状态上色。
@@ -83,6 +92,32 @@ struct Index {
   @State view: string = 'connect';
   @State bootReady: boolean = false;
   @State showGuide: boolean = false;
+  @State chatKind: string = 'dsh';
+  @State localSessions: LocalSession[] = [];
+  @State localEvents: DshEvent[] = [];
+  @State localId: string = '';
+  @State localTitle: string = '';
+  @State localModel: string = '';
+  @State localBusy: boolean = false;
+  @State localUnsaved: boolean = false;
+  @State localNotice: string = '';
+  @State apiProfiles: ApiProfile[] = [];
+  @State selectedApiId: string = '';
+  @State sceneX: number = 0;
+  @State sceneOpacity: number = 1;
+  @State chatChromeHidden: boolean = false;
+  @State chatChromeProgress: number = 0;
+  private chatChrome: ChatChromeController = new ChatChromeController((hidden: boolean) => { this.animateChatChrome(hidden); });
+  private chatCrownQuietTimer: number = -1;
+  private chatFocusTimer: number = -1;
+  private chatScrollOrigin: number = 0;
+  private returnAnimating: boolean = false;
+  @State pickerItems: CrownMenuItem[] = [];
+  private localController?: LocalChatController;
+  private localUiEpoch: number = 0;
+  private localDraftTimer: number = -1;
+  private dshDraft: string = '';
+  private localDeleteArmed: boolean = false;
   @State server: string = '';
   @State primaryServer: string = '';
   @State remoteUrl: string = '';
@@ -126,6 +161,15 @@ struct Index {
   @State modelsLoading: boolean = false;
   @State currentSessionId: string = '';
   @State pageIndex: number = 1;
+  @State swiperInitialIndex: number = 1;
+  @State localBackRequest: number = 0;
+  @State editingInput: boolean = false;
+  @State crownStretch: number = 0;
+  private viewHistory: ViewHistory = new ViewHistory();
+  private lastBackAt: number = 0;
+  private backPanStartX: number = 0;
+  private crownOwner?: Scroller;
+  private crownMotion: CrownElastic = new CrownElastic((stretch: number) => { this.crownStretch = stretch; });
   @State slidePos: number = 1;
   @State notifyEnabled: string = '';
   @State bgState: string = '未启动';
@@ -146,6 +190,7 @@ struct Index {
   private sessionSig: string = '';
   private lastRunning: boolean = false;
   private lastPendingCount: number = 0;
+  private lastApprovalId: string = '';
   private notifySeq: number = 0;
   private bgRunning: boolean = false;
   private delayId: number = -1;
@@ -157,8 +202,21 @@ struct Index {
   private modelsScroller: Scroller = new Scroller();
   private settingsScroller: Scroller = new Scroller();
   private swiper: SwiperController = new SwiperController();
-  private menuScroller: Scroller = new Scroller();
   private diagScroller: Scroller = new Scroller();
+  private menuItems: CrownMenuItem[] = [
+    { key: 'sessions', title: '会话', caption: '本地 API 与 DSH 会话', symbol: '≡' },
+    { key: 'local', title: 'API 设置', caption: '模型、密钥与手机扫码', symbol: '◇' },
+    { key: 'settings', title: '连接设置', caption: '管理 DSH 宿主连接', symbol: '◇' },
+    { key: 'guide', title: '使用引导', caption: '重新认识腕上 DSH', symbol: '?' },
+    { key: 'diagnostics', title: '诊断', caption: '连接、轮询与缓存', symbol: '◎' }
+  ];
+  private quickItems: CrownMenuItem[] = [
+    { key: 'continue', title: '继续', caption: '接着完成当前任务', symbol: '›' },
+    { key: 'status', title: '在干嘛', caption: '看看现在的进展', symbol: '·' },
+    { key: 'summary', title: '总结', caption: '整理刚才的进展', symbol: '≡' },
+    { key: 'pause', title: '停一下', caption: '先停下来，说说状态', symbol: 'Ⅱ' },
+    { key: 'new', title: '新建 DSH 会话', caption: '开始一件新的事', symbol: '+' }
+  ];
   private presets: Preset[] = [
     { label: '继续', text: '继续' },
     { label: '在干嘛', text: '现在在干什么？' },
@@ -172,16 +230,22 @@ struct Index {
 
   aboutToAppear(): void {
     this.measure();
+    this.localController = new LocalChatController(this.ctx(), () => { this.syncLocalView(); });
     this.restore();
   }
 
   onPageShow(): void {
     this.pageVisible = true;
     this.cancelDelay();
+    this.focusMainCrown();
   }
 
   onPageHide(): void {
+    this.resetChatChrome();
+    this.resetCrown();
     this.pageVisible = false;
+    this.localUiEpoch++; this.localController?.cancel();
+    this.flushLocalDraft().catch(() => { this.toast('本地草稿尚未保存'); });
     // 穿戴设备不给长时任务（9800005），退而求其次：申请系统延迟挂起，
     // 通常能多撑几分钟，足够一轮对话跑完。
     this.requestDelay();
@@ -289,6 +353,10 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    this.resetChatChrome();
+    this.resetCrown();
+    this.localUiEpoch++; this.localController?.cancel();
+    this.flushLocalDraft().catch(() => {});
     this.stopPolling();
     this.stopBackground();
     if (this.toastTimer >= 0) {
@@ -361,6 +429,19 @@ struct Index {
       }
     } catch (e) {
     } finally {
+      if (this.localController) {
+        try {
+          await this.localController.initialize();
+          const p = await preferences.getPreferences(this.ctx(), STORE);
+          const kind = await p.get('chatKind', 'dsh');
+          if (kind === 'local' && this.localController.current()) {
+            this.chatKind = 'local';
+            this.syncLocalView();
+            this.promptText = this.localController.current()?.draft || '';
+            this.view = 'main';
+          }
+        } catch (e) { this.toast('本地会话读取失败，未覆盖原数据'); }
+      }
       this.bootReady = true;
       if (!this.showGuide) { this.ensureNotification(); }
     }
@@ -377,6 +458,200 @@ struct Index {
     } catch (e) {
       this.toast('引导进度未保存，下次可能再次显示');
     }
+  }
+
+  private syncLocalView(): void {
+    if (!this.localController) { return; }
+    const wasBusy: boolean = this.localBusy;
+    const current = this.localController.current();
+    this.localSessions = this.localController.sessions();
+    this.localId = current ? current.id : '';
+    this.localTitle = current ? current.title : '新的独立对话';
+    this.localModel = current ? current.model : '';
+    this.localBusy = this.localController.isBusy();
+    this.localUnsaved = this.localController.hasUnsavedReply();
+    this.localNotice = this.localController.status();
+    this.localEvents = this.localController.events();
+    this.apiProfiles = this.localController.profiles();
+    this.selectedApiId = this.localController.activeProfileId();
+    if (wasBusy && !this.localBusy && !this.localUnsaved && this.localNotice === '' && this.chatKind === 'local' && !this.showPrompt) {
+      this.promptText = current ? current.draft : '';
+    }
+    this.updatePicker();
+    if (this.chatKind === 'local' && this.view === 'main') { this.scrollToBottom(); }
+  }
+
+  private updatePicker(): void {
+    const items: CrownMenuItem[] = [
+      { key: 'new-local', title: '新建独立会话', caption: '手表直连 API · 本地保存', symbol: '+' },
+      { key: 'new-dsh', title: '新建 DSH 会话', caption: '由已配对的宿主执行', symbol: '+' }
+    ];
+    for (let i = 0; i < this.localSessions.length; i++) {
+      const item = this.localSessions[i];
+      const active: boolean = this.chatKind === 'local' && item.id === this.localId;
+      items.push({ key: 'api:' + item.id, title: (active ? '✓ ' : '') + item.title,
+        caption: '本地 API · ' + item.model + (item.draft ? ' · 草稿' : ''), symbol: '✦' });
+    }
+    for (let i = 0; i < this.sessions.length; i++) {
+      const item = this.sessions[i];
+      const active: boolean = this.chatKind === 'dsh' && item.id === this.currentSessionId;
+      items.push({ key: 'dsh:' + item.id, title: (active ? '✓ ' : '') + (item.title || item.id),
+        caption: 'DSH · ' + (item.running ? '执行中' : (item.live ? '在线' : '已存档')), symbol: '≡' });
+    }
+    if (this.chatKind === 'local' && this.localId !== '') {
+      items.push({ key: 'delete-local', title: '删除当前本地会话', caption: '连续点两次确认 · 不影响 DSH', symbol: '−' });
+    }
+    this.pickerItems = items;
+  }
+
+  private async rememberChatKind(): Promise<void> {
+    try {
+      const p = await preferences.getPreferences(this.ctx(), STORE);
+      await p.put('chatKind', this.chatKind);
+      await p.flush();
+    } catch (e) { this.toast('未保存启动模式，但聊天记录仍单独保存'); }
+  }
+
+  private async flushLocalDraft(): Promise<void> {
+    if (this.localDraftTimer >= 0) { clearTimeout(this.localDraftTimer); this.localDraftTimer = -1; }
+    if (this.chatKind === 'local' && this.localController && !this.localBusy && !this.localUnsaved) {
+      await this.localController.saveDraft(this.promptText);
+    }
+  }
+
+  private changeComposer(value: string): void {
+    this.promptText = this.chatKind === 'local' ? value.slice(0, 2000) : value;
+    if (this.chatKind !== 'local') { return; }
+    if (this.localDraftTimer >= 0) { clearTimeout(this.localDraftTimer); }
+    this.localDraftTimer = setTimeout(() => {
+      this.localDraftTimer = -1;
+      this.flushLocalDraft().catch(() => { this.toast('草稿未存盘，请勿退出并重试'); });
+    }, 400);
+  }
+
+  private async enterLocal(id: string = '', create: boolean = false): Promise<void> {
+    if (!this.localController || this.changingSession) { return; }
+    this.changingSession = true;
+    try {
+      await this.flushLocalDraft();
+      if (this.chatKind === 'dsh') { this.dshDraft = this.promptText; }
+      this.localUiEpoch++;
+      if (id !== '') { await this.localController.select(id); }
+      else if (create) { await this.localController.create(); }
+      else if (!await this.localController.open()) { this.switchView('local'); return; }
+      this.chatKind = 'local'; this.localDeleteArmed = false; this.stopArmed = false;
+      this.showPrompt = false; this.showModels = false;
+      this.syncLocalView();
+      this.promptText = this.localController.current()?.draft || '';
+      this.goPage(1); this.rememberChatKind();
+    } catch (error) {
+      this.toast((error as Error).message || '本地会话不可用');
+      if (!this.localController.hasConfig() && id === '') { this.switchView('local'); }
+    } finally { this.changingSession = false; }
+  }
+
+  private async openLocalSettings(): Promise<void> {
+    try {
+      if (this.chatKind === 'local') { this.localUiEpoch++; this.localController?.cancel(); }
+      await this.flushLocalDraft(); this.switchView('local');
+    } catch (e) { this.toast('草稿未保存，请重试后再改配置'); }
+  }
+
+  private async reloadApiProfiles(): Promise<void> {
+    try { await this.localController?.reloadProfiles(); this.syncLocalView(); }
+    catch (e) { this.toast('API 配置读取失败，未清除原数据'); }
+  }
+
+  private async chooseApiProfile(id: string): Promise<void> {
+    if (!this.localController || this.localBusy) { this.toast('请先等待或停止当前回复'); return; }
+    try {
+      await this.flushLocalDraft();
+      if (this.chatKind === 'dsh') { this.dshDraft = this.promptText; }
+      this.localUiEpoch++;
+      await this.localController.useProfile(id);
+      this.chatKind = 'local'; this.syncLocalView();
+      this.promptText = this.localController.current()?.draft || '';
+      this.closeModels(); this.goPage(1); this.rememberChatKind();
+      this.toast('已选择 API，原会话保留');
+    } catch (error) { this.toast((error as Error).message || '未能切换 API；原数据保留'); }
+  }
+
+  private async configuredLocal(config: DirectApiConfig): Promise<void> {
+    if (!this.localController) { return; }
+    try {
+      await this.flushLocalDraft();
+      if (this.chatKind === 'dsh') { this.dshDraft = this.promptText; }
+      this.localUiEpoch++;
+      await this.localController.configured(config);
+      this.chatKind = 'local'; this.syncLocalView();
+      this.promptText = this.localController.current()?.draft || '';
+      this.goPage(1); this.rememberChatKind();
+    } catch (error) { this.toast((error as Error).message || '配置已保存，但未能打开会话'); }
+  }
+
+  private async sendLocal(): Promise<void> {
+    if (!this.localController || this.localBusy) { return; }
+    if (this.localUnsaved) {
+      try { await this.localController.retrySave(); this.promptText = ''; }
+      catch (e) { this.toast('回复仍未保存，请检查手表存储后重试'); }
+      return;
+    }
+    if (this.localDraftTimer >= 0) { clearTimeout(this.localDraftTimer); this.localDraftTimer = -1; }
+    const id: string = this.localId;
+    const epoch: number = ++this.localUiEpoch;
+    const text: string = this.promptText;
+    this.closePrompt(); this.goPage(1);
+    try {
+      await this.localController.send(text);
+      if (epoch === this.localUiEpoch && this.chatKind === 'local' && this.localId === id) {
+        this.promptText = this.localController.current()?.draft || '';
+      }
+    } catch (error) {
+      if (epoch === this.localUiEpoch && this.chatKind === 'local') { this.toast((error as Error).message); }
+    }
+  }
+
+  private async pickSession(key: string): Promise<void> {
+    if (key === 'new-local') { this.enterLocal('', true); return; }
+    if (key.startsWith('api:')) { this.enterLocal(key.substring(4)); return; }
+    if (key === 'delete-local') {
+      if (!this.localDeleteArmed) { this.localDeleteArmed = true; this.toast('再点一次，删除当前本地会话'); return; }
+      this.localDeleteArmed = false;
+      try {
+        this.localUiEpoch++; await this.localController?.removeCurrent(); this.syncLocalView();
+        this.promptText = this.localController?.current()?.draft || '';
+      } catch (error) { this.toast((error as Error).message); }
+      return;
+    }
+    this.localDeleteArmed = false;
+    if (key === 'new-dsh') {
+      if (this.token === '') { this.toast('请先连接 DSH 宿主'); return; }
+      await this.useDsh(); this.doNew(); return;
+    }
+    if (key.startsWith('dsh:')) { await this.doSelect(key.substring(4)); }
+  }
+
+  private async useDsh(): Promise<void> {
+    if (this.localUnsaved) { throw new Error('请先保存已收到的本地回复'); }
+    if (this.chatKind === 'local') {
+      await this.flushLocalDraft(); this.localUiEpoch++; this.localController?.cancel();
+      this.chatKind = 'dsh'; this.promptText = this.dshDraft; this.stopArmed = false;
+      this.showPrompt = false; this.showModels = false; this.updatePicker(); this.rememberChatKind();
+    }
+  }
+
+  private chatEvents(): DshEvent[] { return this.chatKind === 'local' ? this.localEvents : visibleFeedEvents(this.events); }
+  private chatEventKey(event: DshEvent): string {
+    // 本地历史裁剪后会复用位置序号；内容变化必须让 ForEach 更新气泡，而不是显示旧行。
+    const text: string = event.text || '';
+    let hash: number = 0;
+    for (let i = 0; i < text.length; i++) { hash = (hash * 31 + text.charCodeAt(i)) >>> 0; }
+    return event.sessionId + ':' + event.seq + ':' + event.kind + ':' + text.length + ':' + hash;
+  }
+  private chatTitle(): string { return this.chatKind === 'local' ? '✦ ' + this.localTitle : (this.title || 'DSH Watch'); }
+  private modelCaption(): string {
+    if (this.chatKind === 'local') { return '模型 · ' + (this.localModel || '选择 API'); }
+    return '模型 · ' + (this.selectionModel || '跟随默认') + (this.modelPending ? ' · 下轮生效' : '');
   }
 
   private async saveHistory(sessionId: string, events: DshEvent[]): Promise<void> {
@@ -624,6 +899,7 @@ struct Index {
     if (nextSessionId !== this.currentSessionId) {
       this.currentSessionId = nextSessionId;
       this.sessionSource.set(this.sessions);
+      this.updatePicker();
     }
     if (this.feedSessionId !== '' && nextSessionId !== this.feedSessionId && this.events.length > 0) {
       this.saveHistory(this.feedSessionId, this.events);
@@ -639,7 +915,7 @@ struct Index {
     this.lastSeq = feed.lastSeq;
     this.events = feed.events;
     if (grew) {
-      this.scrollToBottom();
+      if (this.chatKind === 'dsh') { this.scrollToBottom(); }
       const now: number = Date.now();
       if (now - this.lastSaveAt > 3000) {
         this.lastSaveAt = now;
@@ -648,16 +924,21 @@ struct Index {
     }
     const pend: PendingInfo[] = snap.pending ? snap.pending : [];
     this.pending = pend;
-    if (pend.length > 0 && this.view !== 'approval' && this.view !== 'prompt') {
+    const newApproval: boolean = pend.length > 0 && (this.lastPendingCount === 0 || pend[0].id !== this.lastApprovalId);
+    if (pend.length > 0 && (this.view === 'local' || this.chatKind === 'local') && this.lastPendingCount === 0) {
+      this.toast('DSH 有待审批，返回后可处理');
+    }
+    if (newApproval && this.view !== 'approval' && this.view !== 'prompt' && this.view !== 'local' && this.chatKind !== 'local') {
       this.switchView('approval');
     }
     if (pend.length === 0 && this.view === 'approval') {
-      this.switchView('main');
+      this.backScene();
     }
     const running: boolean = this.status === 'running';
     this.notifyTransitions(this.lastRunning, running, pend.length);
     this.lastRunning = running;
     this.lastPendingCount = pend.length;
+    this.lastApprovalId = pend.length > 0 ? pend[0].id : '';
     if (running) {
       this.modelPending = false;
     }
@@ -746,6 +1027,7 @@ struct Index {
   }
 
   private async openModels(): Promise<void> {
+    this.resetChatChrome();
     if (this.showModels) {
       return;
     }
@@ -757,6 +1039,10 @@ struct Index {
       try { this.getUIContext().getFocusController().requestFocus('crown-models'); } catch (e) { }
     }, 150);
     try {
+      if (this.chatKind === 'local') {
+        await this.localController?.reloadProfiles();
+        this.syncLocalView(); return;
+      }
       const catalog = await fetchModels(this.server, this.token, this.feedSessionId);
       if (catalog.ok === true) { this.modelOptions = catalog.providers; }
     } catch (e) {
@@ -791,11 +1077,14 @@ struct Index {
       this.showModels = false;
     });
     setTimeout(() => {
-      try { this.getUIContext().getFocusController().requestFocus('crown-main'); } catch (e) { }
+      this.focusMainCrown();
     }, 240);
   }
 
   private openPrompt(): void {
+    this.resetChatChrome();
+    if (this.chatKind === 'local' && this.localUnsaved) { this.sendLocal(); return; }
+    if (this.chatKind === 'local' && this.localBusy) { this.toast('请等待回复或先停止'); return; }
     animateTo({ duration: 260, curve: Curve.FastOutSlowIn }, () => {
       this.showPrompt = true;
     });
@@ -805,49 +1094,116 @@ struct Index {
     animateTo({ duration: 200, curve: Curve.EaseIn }, () => {
       this.showPrompt = false;
     });
+    this.focusMainCrown();
+  }
+
+  private location(): WatchLocation { return { view: this.view, page: this.pageIndex }; }
+
+  private recordLocation(next: WatchLocation): void {
+    this.resetChatChrome();
+    if (this.bootReady) { this.viewHistory.record(this.location(), next); }
+    this.resetCrown();
+    this.editingInput = false;
   }
 
   private switchView(v: string): void {
-    if (v === 'menu') {
-      this.goPage(0);
-      return;
-    }
-    if (v === 'main') {
-      this.goPage(1);
-      return;
-    }
-    animateTo({ duration: 200, curve: Curve.EaseOut }, () => {
-      this.view = v;
-    });
-    if (v === 'diagnostics') {
-      this.refreshNotifyState();
-    }
-    setTimeout(() => {
-      try {
-        this.getUIContext().getFocusController().requestFocus('crown-' + v);
-      } catch (e) {
-      }
-    }, 120);
+    if (v === 'menu') { this.goPage(0); return; }
+    if (v === 'main') { this.goPage(1); return; }
+    this.recordLocation({ view: v, page: this.pageIndex });
+    // 再创建 Swiper 时保留其实际来源页，不重置到固定的中间页。
+    this.swiperInitialIndex = this.pageIndex;
+    animateTo({ duration: 200, curve: Curve.EaseOut }, () => { this.view = v; });
+    if (v === 'diagnostics') { this.refreshNotifyState(); }
+    this.focusLocation();
   }
 
   private goPage(index: number): void {
-    this.pageIndex = index;
-    this.view = 'main';
-    try {
-      this.swiper.changeIndex(index, true);
-    } catch (e) {
-    }
-    if (index === 2) {
-      this.refreshSessions();
-    }
-    setTimeout(() => {
-      try {
-        const id: string = index === 0 ? 'crown-menu' : (index === 2 ? 'crown-sessions' : 'crown-main');
-        this.getUIContext().getFocusController().requestFocus(id);
-      } catch (e) {
-      }
-    }, 160);
+    this.recordLocation({ view: 'main', page: index });
+    const recreate: boolean = this.view !== 'main';
+    if (recreate) { this.swiperInitialIndex = index; this.slidePos = index; }
+    this.pageIndex = index; this.view = 'main';
+    if (!recreate) { try { this.swiper.changeIndex(index, true); } catch (e) { } }
+    if (index === 2) { this.refreshSessions(); }
+    this.focusLocation();
   }
+
+  private focusLocation(): void {
+    setTimeout(() => {
+      const id: string = this.view === 'main'
+        ? (this.pageIndex === 0 ? 'crown-menu' : (this.pageIndex === 2 ? 'crown-quick' : 'crown-main'))
+        : 'crown-' + this.view;
+      try { this.getUIContext().getFocusController().requestFocus(id); } catch (e) { }
+    }, 140);
+  }
+
+  private animateReturn(action: () => void): void {
+    if (this.returnAnimating) { return; }
+    this.returnAnimating = true;
+    this.resetChatChrome();
+    this.resetCrown();
+    // 先让当前页退出，再替换内容并让上一页进入；不依赖条件节点是否自带 transition。
+    animateTo({ duration: 110, curve: Curve.EaseIn, onFinish: () => {
+      action();
+      this.sceneX = -this.px(20); this.sceneOpacity = 0.2;
+      animateTo({ duration: 170, curve: Curve.EaseOut, onFinish: () => { this.returnAnimating = false; } }, () => {
+        this.sceneX = 0; this.sceneOpacity = 1;
+      });
+    } }, () => { this.sceneX = this.px(30); this.sceneOpacity = 0; });
+  }
+
+  private restoreLocation(target: WatchLocation): void {
+    this.animateReturn(() => {
+      this.editingInput = false;
+      this.localDeleteArmed = false; this.showModels = false; this.showPrompt = false;
+      this.swiperInitialIndex = target.page; this.pageIndex = target.page;
+      this.slidePos = target.page; this.view = target.view;
+      if (target.view === 'main') {
+        try { this.swiper.changeIndex(target.page, false); } catch (e) { }
+      }
+      this.focusLocation();
+    });
+  }
+
+  private backScene(): void {
+    const target = this.viewHistory.pop();
+    if (target) { this.restoreLocation(target); }
+    else { this.restoreLocation({ view: this.token !== '' || this.chatKind === 'local' ? 'main' : 'connect', page: 1 }); }
+  }
+
+  onBackPress(): boolean { return this.requestBack(); }
+
+  private requestBack(): boolean {
+    if (!this.bootReady || this.returnAnimating) { return true; }
+    // 系统边缘返回和组件手势有时会同一轮到达，只消费一次。
+    const now: number = Date.now();
+    if (now - this.lastBackAt < 350) { return true; }
+    this.lastBackAt = now;
+    if (this.editingInput) {
+      this.editingInput = false;
+      try { this.getUIContext().getFocusController().clearFocus(); } catch (e) { }
+      return true;
+    }
+    if (this.showPrompt) {
+      this.flushLocalDraft().catch(() => { this.toast('草稿未存盘，请重试'); });
+      this.closePrompt(); return true;
+    }
+    if (this.showModels) { this.closeModels(); return true; }
+    if (this.showGuide) { this.animateReturn(() => { this.finishGuide(); }); return true; }
+    if (this.view === 'local') { this.localBackRequest++; return true; }
+    if (this.viewHistory.size() > 0) { this.backScene(); return true; }
+    if (this.view !== 'main' && this.view !== 'connect') { this.backScene(); return true; }
+    return false; // 只有真正根界面才允许系统退出 App。
+  }
+
+  private isBackSurface(): boolean {
+    return this.view !== 'main' || this.showPrompt || this.showModels || this.showGuide;
+  }
+
+  private resetCrown(): void {
+    this.crownMotion.cancel(); this.crownOwner = undefined;
+  }
+
+  private crownOffset(target: Scroller): number { return this.crownOwner === target ? this.crownStretch : 0; }
 
   private edgeOpacity(idx: number): number {
     const itemH: number = 34;
@@ -881,14 +1237,98 @@ struct Index {
     return this.scroller;
   }
 
-  private handleCrown(target: Scroller, event: CrownEvent): void {
-    if (event.action !== CrownAction.UPDATE) {
-      return;
-    }
+  private measureChatStart(): void {
     try {
-      target.scrollBy(0, -event.degree * 2);
-    } catch (e) {
+      const first: RectResult = this.scroller.getItemRect(0);
+      if (first.height > 0) {
+        this.chatScrollOrigin = this.scroller.currentOffset().yOffset + first.y - this.px(48);
+      }
+    } catch (e) { }
+  }
+
+  private canImmerseChat(): boolean {
+    return this.view === 'main' && this.pageIndex === 1 && !this.showPrompt && !this.showModels &&
+      !this.showGuide && this.pageVisible && !this.returnAnimating;
+  }
+
+  private focusMainCrown(retry: boolean = true): void {
+    if (!this.canImmerseChat()) { return; }
+    try { this.getUIContext().getFocusController().requestFocus('crown-main'); } catch (e) { }
+    if (retry && this.chatFocusTimer < 0) {
+      // API 20 的 requestFocus 没有返回值；首次挂载后只补一次，并重新检查当前页面。
+      this.chatFocusTimer = setTimeout(() => {
+        this.chatFocusTimer = -1; this.focusMainCrown(false);
+      }, 80);
     }
+  }
+
+  private routeMainCrown(event: CrownEvent): void {
+    if (!this.canImmerseChat()) { return; }
+    event.stopPropagation();
+    this.handleCrown(this.scroller, event);
+  }
+
+  private animateChatChrome(hidden: boolean): void {
+    if (this.chatChromeHidden === hidden) { return; }
+    this.chatChromeHidden = hidden;
+    animateTo({ duration: hidden ? 150 : 220, curve: Curve.EaseOut }, () => {
+      this.chatChromeProgress = hidden ? 1 : 0;
+    });
+  }
+
+  private finishChatCrown(): void {
+    if (this.chatCrownQuietTimer >= 0) { clearTimeout(this.chatCrownQuietTimer); this.chatCrownQuietTimer = -1; }
+    this.chatChrome.crownEnd();
+  }
+
+  private resetChatChrome(): void {
+    if (this.chatFocusTimer >= 0) { clearTimeout(this.chatFocusTimer); this.chatFocusTimer = -1; }
+    if (this.chatCrownQuietTimer >= 0) { clearTimeout(this.chatCrownQuietTimer); this.chatCrownQuietTimer = -1; }
+    this.chatChrome.reset();
+  }
+
+  private handleChatTouch(event: TouchEvent): void {
+    if (event.type === TouchType.Up || event.type === TouchType.Cancel) { this.chatChrome.touchEnd(); return; }
+    if (!this.canImmerseChat() || event.touches.length === 0) { return; }
+    const point: TouchObject = event.touches[0];
+    if (event.type === TouchType.Down) {
+      this.focusMainCrown();
+      this.finishChatCrown(); this.chatChrome.touchStart(point.x, point.y);
+    } else if (event.type === TouchType.Move) {
+      this.chatChrome.touchMove(point.x, point.y, this.px(6));
+    }
+  }
+
+  private handleChatCrown(event: CrownEvent): void {
+    if (event.action === CrownAction.END) { this.finishChatCrown(); return; }
+    if (event.action !== CrownAction.UPDATE || event.degree === 0 || !this.canImmerseChat()) { return; }
+    this.chatChrome.crownUpdate();
+    if (this.chatCrownQuietTimer >= 0) { clearTimeout(this.chatCrownQuietTimer); }
+    // END 因焦点/系统取消而丢失时仍能恢复，连续更新只重置这一只短定时器。
+    this.chatCrownQuietTimer = setTimeout(() => {
+      this.chatCrownQuietTimer = -1; this.chatChrome.crownEnd();
+    }, 260);
+  }
+
+  private handleCrown(target: Scroller, event: CrownEvent): void {
+    if (target === this.scroller) { this.handleChatCrown(event); }
+    if (this.crownOwner !== target) { this.resetCrown(); this.crownOwner = target; }
+    if (event.action === CrownAction.BEGIN) { this.crownMotion.begin(); return; }
+    if (event.action === CrownAction.END) { this.crownMotion.end(); return; }
+    if (event.action !== CrownAction.UPDATE) { return; }
+    try {
+      if (target === this.scroller) { this.measureChatStart(); }
+      const current: number = target.currentOffset().yOffset;
+      const origin: number = target === this.scroller ? this.chatScrollOrigin : 0;
+      const next: number = this.crownMotion.updateAtEdges(-event.degree * 2, current,
+        current <= origin + 0.5, target.isAtEnd());
+      if (target === this.scroller) {
+        // List 的 contentStartOffset 可能令 currentOffset 为负；scrollTo 会把负目标归 0。
+        target.scrollBy(0, next - current);
+      } else {
+        target.scrollTo({ xOffset: 0, yOffset: next, animation: false });
+      }
+    } catch (e) { this.resetCrown(); }
   }
 
   private async doConnect(): Promise<void> {
@@ -931,6 +1371,7 @@ struct Index {
   }
 
   private async doSend(mode: string): Promise<void> {
+    if (this.chatKind === 'local') { await this.sendLocal(); return; }
     const t: string = this.promptText.trim();
     if (t === '' || this.token === '') {
       return;
@@ -951,6 +1392,10 @@ struct Index {
   }
 
   private async sendPreset(text: string): Promise<void> {
+    if (this.chatKind === 'local') {
+      if (this.localBusy) { this.toast('请等待当前回复'); return; }
+      this.changeComposer(text); await this.sendLocal(); return;
+    }
     if (this.token === '') {
       return;
     }
@@ -976,7 +1421,7 @@ struct Index {
       const r: SimpleResult = await decideApproval(this.server, this.token, id, decision);
       if (r.ok === true) {
         this.pending = [];
-        this.switchView('main');
+        this.backScene();
         this.toast(decision === 'allow' ? '已允许' : '已拒绝');
       } else {
         this.toast('提交失败');
@@ -987,6 +1432,8 @@ struct Index {
   }
 
   private async doNew(): Promise<void> {
+    if (this.chatKind === 'local') { await this.enterLocal('', true); return; }
+    if (this.token === '') { this.toast('请先连接 DSH 宿主'); return; }
     if (this.changingSession) { return; }
     this.changingSession = true;
     this.requestGeneration += 1;
@@ -1014,6 +1461,9 @@ struct Index {
   }
 
   private openSessions(): void {
+    this.localDeleteArmed = false;
+    this.updatePicker();
+    this.flushLocalDraft().catch(() => { this.toast('当前草稿未保存，请重试'); });
     this.switchView('sessions');
     this.refreshSessions();
   }
@@ -1042,16 +1492,21 @@ struct Index {
     if (sig !== this.sessionSig) {
       this.sessionSig = sig;
       this.sessionSource.set(list);
+      this.updatePicker();
     }
   }
 
   private async doSelect(id: string): Promise<void> {
+    if (this.token === '') { this.toast('请先连接 DSH 宿主'); return; }
+    if (this.localUnsaved) { this.toast('请先保存已收到的本地回复'); return; }
     if (this.changingSession) { return; }
     this.changingSession = true;
     this.requestGeneration += 1;
     try {
+      await this.flushLocalDraft();
       const r: SimpleResult = await selectSession(this.server, this.token, id);
       if (r.ok === true) {
+        await this.useDsh();
         if (this.feedSessionId !== '') {
           await this.saveHistory(this.feedSessionId, this.events);
         }
@@ -1088,6 +1543,10 @@ struct Index {
     if (this.stopTimer >= 0) {
       clearTimeout(this.stopTimer);
       this.stopTimer = -1;
+    }
+    if (this.chatKind === 'local') {
+      this.localUiEpoch++; this.localController?.cancel();
+      this.toast('已停止，输入已留在本地草稿'); return;
     }
     try {
       await cancelTurn(this.server, this.token);
@@ -1253,6 +1712,17 @@ struct Index {
       } else if (this.showGuide) {
         QuickGuide({ screenWidth: this.sw, screenHeight: this.sh,
           onFinish: () => { this.finishGuide(); } })
+      } else if (this.view === 'local') {
+        LocalChat({ screenWidth: this.sw, screenHeight: this.sh,
+          hostBase: this.server, hostToken: this.token, settingsOnly: true,
+          onConfigured: (config: DirectApiConfig) => { this.configuredLocal(config); },
+          onProfileConfigured: (profile: ApiProfile) => { this.chooseApiProfile(profile.id); },
+          onProfilesChanged: () => { this.reloadApiProfiles(); },
+          onConfigCleared: () => { this.localController?.credentialsCleared(); },
+          backRequest: this.localBackRequest,
+          onRequestBack: () => { this.requestBack(); },
+          onEditingChanged: (editing: boolean) => { this.editingInput = editing; },
+          onClose: () => { this.backScene(); } })
       } else if (this.view === 'connect') {
         this.ConnectView()
       } else if (this.view === 'approval') {
@@ -1270,7 +1740,7 @@ struct Index {
             this.MainView()
             this.QuickView()
           }
-          .index(1)
+          .index(this.swiperInitialIndex)
           .indicator(false)
           .loop(false)
           .cachedCount(1)
@@ -1280,13 +1750,22 @@ struct Index {
             this.slidePos = swiperProgress(index, position, 3);
           })
           .onAppear(() => {
-            // Swiper 离开主界面后会被销毁；重建的初始页是 .index(1)。
-            this.pageIndex = 1;
-            this.slidePos = 1;
+            // 返回子页面来源时按历史重建，不把菜单/快捷强制重置成聊天页。
+            this.pageIndex = this.swiperInitialIndex;
+            this.slidePos = this.swiperInitialIndex;
+          })
+          .onAnimationEnd((i: number, _extra: SwiperAnimationEvent) => {
+            // 缓存页出现时不能抢焦点；翻页完成后把表冠明确交给当前页。
+            if (this.view !== 'main' || this.showGuide) { return; }
+            const focus: string = i === 0 ? 'crown-menu' : (i === 2 ? 'crown-quick' : 'crown-main');
+            try { this.getUIContext().getFocusController().requestFocus(focus); } catch (e) { }
           })
           .onChange((i: number) => {
+            this.resetChatChrome();
             this.pageIndex = i;
             // 选中项事件不驱动白条，不能提前抢走尚未结束的原生动画。
+            const focus: string = i === 0 ? 'crown-menu' : (i === 2 ? 'crown-quick' : 'crown-main');
+            try { this.getUIContext().getFocusController().requestFocus(focus); } catch (e) { }
             if (i === 2) {
               this.refreshSessions();
             }
@@ -1324,11 +1803,27 @@ struct Index {
     .height('100%')
     .backgroundColor(BG)
     .linearGradient({ angle: 150, colors: [['#162D32', 0], ['#0B151C', 0.32], [BG, 0.76], ['#0B151B', 1]] })
+    .translate({ x: this.sceneX })
+    .opacity(this.sceneOpacity)
+    .onTouch((event: TouchEvent) => {
+      if (event.type === TouchType.Down) {
+        this.resetCrown(); this.finishChatCrown();
+        this.backPanStartX = event.touches.length > 0 ? event.touches[0].x : 0;
+      } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
+        // 列表手势被 Swiper/系统接管后，也不能让操作层一直留在隐藏状态。
+        this.chatChrome.touchEnd(); this.focusMainCrown();
+      }
+    })
+    .parallelGesture(PanGesture({ fingers: 1, direction: PanDirection.Right, distance: 18 })
+      .onActionEnd((event: GestureEvent) => {
+        if (this.isBackSurface() && isWatchBackSwipe(this.backPanStartX, event.offsetX,
+          event.offsetY, this.sw, this.editingInput)) { this.requestBack(); }
+      }))
   }
 
   @Builder
   ConnectView() {
-    Scroll() {
+    Scroll(this.connectScroller) {
       Column() {
         Text('DSH')
           .id('crown-connect')
@@ -1355,6 +1850,7 @@ struct Index {
           .backgroundColor(CARD)
           .border({ width: 0.5, color: HAIRLINE })
           .borderRadius(this.px(12))
+          .onEditChange((editing: boolean) => { this.editingInput = editing; })
           .onChange((v: string) => { this.server = v; })
         TextInput({ placeholder: '六位配对码', text: this.code })
           .type(InputType.Number)
@@ -1367,7 +1863,19 @@ struct Index {
           .border({ width: 0.5, color: HAIRLINE })
           .borderRadius(this.px(12))
           .margin({ top: this.px(7) })
+          .onEditChange((editing: boolean) => { this.editingInput = editing; })
           .onChange((v: string) => { this.code = v; })
+        Text('独立 API 对话')
+          .fontSize(this.vp(10))
+          .fontColor(ACCENT)
+          .textAlign(TextAlign.Center)
+          .height(this.px(34))
+          .width('100%')
+          .backgroundColor('#142126')
+          .borderRadius(this.px(17))
+          .margin({ top: this.px(10) })
+          .clickEffect({ level: ClickEffectLevel.LIGHT })
+          .onClick(() => { this.enterLocal(); })
         Text('先进入工作台')
           .fontSize(this.vp(8))
           .fontColor(DIM)
@@ -1396,6 +1904,7 @@ struct Index {
     .height('100%')
     .scrollBar(BarState.Off)
     .edgeEffect(EdgeEffect.Spring)
+    .translate({ y: this.crownStretch })
   }
 
   @Builder
@@ -1434,40 +1943,16 @@ struct Index {
   @Builder
   MainView() {
     Stack({ alignContent: Alignment.Center }) {
-      Column() {
-        Row() {
-          Text(this.title === '' ? 'DSH Watch' : this.title)
-            .id('crown-main')
-            .fontSize(this.vp(10))
-            .fontWeight(FontWeight.Medium)
-            .fontColor(TEXT)
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .layoutWeight(1)
-            .focusable(true)
-            .focusOnTouch(true)
-            .defaultFocus(true)
-            .onDigitalCrown((event: CrownEvent) => {
-              this.handleCrown(this.scroller, event);
-            })
-          Circle({ width: this.vp(5), height: this.vp(5) })
-            .fill(this.connected ? (this.status === 'running' ? WARN : OK) : DIM)
-            .margin({ left: this.px(7) })
-        }
-        .width('100%')
-        .height(this.px(26))
-        .padding({ left: this.px(44), right: this.px(44) })
-        .margin({ bottom: this.px(3) })
-
+        // 聊天永久铺满该页，顶/底操作层浮在上方；隐藏时不改变 List 高度或滚动位置。
         List({ scroller: this.scroller }) {
-          if (visibleFeedEvents(this.events).length === 0) {
+          if (this.chatEvents().length === 0) {
             ListItem() {
               Column() {
-                Text(this.connected ? '一切就绪' : '正在重连')
+                Text(this.chatKind === 'local' ? '独立对话' : (this.connected ? '一切就绪' : '正在重连'))
                   .fontSize(this.vp(13))
                   .fontWeight(FontWeight.Medium)
                   .fontColor(TEXT)
-                Text(this.connected ? '从腕上发起下一步' : '等待设备重新上线')
+                Text(this.chatKind === 'local' ? '记录保存在手表 · 无需宿主在线' : (this.connected ? '从腕上发起下一步' : '等待设备重新上线'))
                   .fontSize(this.vp(8))
                   .fontColor(DIM)
                   .margin({ top: this.px(5) })
@@ -1476,7 +1961,7 @@ struct Index {
               .padding({ top: this.px(22), bottom: this.px(22) })
             }
           } else {
-            ForEach(visibleFeedEvents(this.events), (ev: DshEvent, idx: number) => {
+            ForEach(this.chatEvents(), (ev: DshEvent, idx: number) => {
               ListItem() {
                 if (ev.kind === 'user' || ev.kind === 'assistant') {
                   Row() {
@@ -1486,6 +1971,14 @@ struct Index {
                   .justifyContent(ev.kind === 'user' ? FlexAlign.End : FlexAlign.Start)
                   .padding({ left: this.px(4), right: this.px(4), top: this.px(3), bottom: this.px(3) })
                   .opacity(1)
+                } else if (ev.kind === 'info') {
+                  Text(ev.text || '')
+                    .fontSize(this.vp(9))
+                    .lineHeight(this.vp(13))
+                    .fontColor(DIM)
+                    .textAlign(TextAlign.Center)
+                    .width('100%')
+                    .padding({ top: this.px(6), bottom: this.px(6), left: this.px(12), right: this.px(12) })
                 } else {
                   Column() {
                     Row() {
@@ -1520,17 +2013,66 @@ struct Index {
                   .opacity(1)
                 }
               }
-            }, (ev: DshEvent) => ev.seq.toString())
+            }, (ev: DshEvent) => this.chatEventKey(ev))
           }
         }
-        .layoutWeight(1)
         .width('100%')
+        .height('100%')
+        .contentStartOffset(this.px(48))
+        .contentEndOffset(this.px(this.pending.length > 0 ? 90 : 64))
+        .padding({ left: this.px(17), right: this.px(17) })
         .scrollBar(BarState.Off)
-        .edgeEffect(EdgeEffect.Spring)
-        .onScroll((offset: number, state: ScrollState) => { this.scrollY = offset; })
-        .onAreaChange((oldValue: Area, newValue: Area) => { this.viewH = newValue.height as number; })
+        .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
+        .translate({ y: this.crownOffset(this.scroller) })
+        .onTouch((event: TouchEvent) => { this.handleChatTouch(event); })
+        .onScroll((offset: number, _state: ScrollState) => { this.scrollY = offset; this.measureChatStart(); })
+        .onAreaChange((_old: Area, area: Area) => { this.viewH = area.height as number; this.measureChatStart(); })
         .focusable(false)
 
+        // 叶子焦点不随顶栏淡出移动，也不与 List 自带的表冠滚动争抢。
+        Text(' ')
+          .id('crown-main')
+          .width(this.px(12)).height(this.px(12))
+          .fontColor('#00484848')
+          .position({ x: this.px(110), y: this.px(52) })
+          .focusable(true)
+          .defaultFocus(true)
+          .hitTestBehavior(HitTestMode.None)
+          .accessibilityLevel('no')
+          .onDigitalCrown((event: CrownEvent) => { this.routeMainCrown(event); })
+
+        // 全高纵向布局用弹性空白分开上下操作层；align() 只对齐组件内部内容，不能定位 Stack 子项。
+        Column() {
+        Column() {
+        Row() {
+          Text(this.chatTitle())
+            .fontSize(this.vp(10))
+            .fontWeight(FontWeight.Medium)
+            .fontColor(TEXT)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .layoutWeight(1)
+          Circle({ width: this.vp(5), height: this.vp(5) })
+            .fill(this.chatKind === 'local' ? (this.localBusy ? WARN : ACCENT) : (this.connected ? (this.status === 'running' ? WARN : OK) : DIM))
+            .margin({ left: this.px(7) })
+        }
+        .width('100%')
+        .height(this.px(26))
+        .padding({ left: this.px(57), right: this.px(57) })
+        }
+        .id('chat-header')
+        .width('100%')
+        .height(this.px(48))
+        .padding({ top: this.px(18), bottom: this.px(4) })
+        .opacity(1 - this.chatChromeProgress)
+        .translate({ y: -this.px(64) * this.chatChromeProgress })
+        .hitTestBehavior(this.chatChromeHidden ? HitTestMode.None : HitTestMode.Default)
+
+        Blank()
+          .layoutWeight(1)
+          .hitTestBehavior(HitTestMode.None)
+
+        Column() {
         if (this.pending.length > 0) {
           Text('待审批  ' + this.pending.length + '  ›')
             .fontSize(this.vp(9))
@@ -1552,7 +2094,7 @@ struct Index {
               .fontSize(this.vp(15))
               .fontColor(ACCENT)
               .margin({ right: this.px(6) })
-            Text(this.promptText.trim() === '' ? '发送指令' : this.promptText)
+            Text(this.localUnsaved && this.chatKind === 'local' ? '重试保存回复' : (this.promptText.trim() === '' ? (this.chatKind === 'local' ? '发消息' : '发送指令') : this.promptText))
               .fontSize(this.vp(9))
               .fontColor(TEXT)
               .maxLines(1)
@@ -1587,9 +2129,7 @@ struct Index {
         .margin({ top: this.px(7), bottom: this.px(2) })
 
         Row() {
-          Text(this.modelPending
-            ? ('模型 · ' + (this.selectionModel === '' ? '默认' : this.selectionModel) + ' · 下轮生效')
-            : ('模型 · ' + (this.selectionModel === '' ? '跟随默认' : this.selectionModel)))
+          Text(this.modelCaption())
             .fontSize(this.vp(7))
             .fontColor(this.modelPending ? WARN : (this.selectionModel === '' ? DIM : ACCENT))
             .height(this.px(16))
@@ -1606,9 +2146,17 @@ struct Index {
         .margin({ top: this.px(3) })
 
       }
+      .id('chat-footer')
       .width('100%')
-      .height('100%')
-      .padding({ left: this.px(13), right: this.px(13), top: this.px(18), bottom: this.px(8) })
+      .padding({ left: this.px(13), right: this.px(13), bottom: this.px(8) })
+      .opacity(1 - this.chatChromeProgress)
+      .translate({ y: this.px(108) * this.chatChromeProgress })
+      .hitTestBehavior(this.chatChromeHidden ? HitTestMode.None : HitTestMode.Default)
+        }
+        .id('chat-controls-overlay')
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.Transparent)
 
       if (this.showPrompt) {
         Stack() {
@@ -1619,7 +2167,7 @@ struct Index {
             .onClick(() => { this.closePrompt(); })
           Column() {
             Row() {
-              Text('新指令')
+              Text(this.chatKind === 'local' ? '新消息' : '新指令')
                 .fontSize(this.vp(11))
                 .fontWeight(FontWeight.Medium)
                 .fontColor(TEXT)
@@ -1648,8 +2196,10 @@ struct Index {
               .width('100%')
               .padding(this.px(8))
               .margin({ top: this.px(5) })
-              .onChange((v: string) => { this.promptText = v; })
+              .onEditChange((editing: boolean) => { this.editingInput = editing; })
+          .onChange((v: string) => { this.changeComposer(v); })
             Row() {
+              if (this.chatKind === 'dsh') {
               Text('插话')
                 .fontSize(this.vp(9))
                 .fontColor(TEXT)
@@ -1661,6 +2211,7 @@ struct Index {
                 .borderRadius(this.px(14))
                 .clickEffect({ level: ClickEffectLevel.LIGHT })
                 .onClick(() => { this.doSend('steer'); })
+              }
               Text('发送 ↗')
                 .fontSize(this.vp(9))
                 .fontWeight(FontWeight.Medium)
@@ -1670,7 +2221,7 @@ struct Index {
                 .layoutWeight(1)
                 .backgroundColor(ACCENT)
                 .borderRadius(this.px(14))
-                .margin({ left: this.px(7) })
+                .margin({ left: this.chatKind === 'local' ? 0 : this.px(7) })
                 .clickEffect({ level: ClickEffectLevel.LIGHT })
                 .onClick(() => { this.doSend('followup'); })
             }
@@ -1715,7 +2266,7 @@ struct Index {
             }
             .width('100%')
             .height(this.px(22))
-            if (this.modelsLoading && this.modelOptions.length === 0) {
+            if (this.modelsLoading && (this.chatKind === 'local' ? this.apiProfiles.length === 0 : this.modelOptions.length === 0)) {
               Text('读取中…')
                 .fontSize(this.vp(9))
                 .fontColor(DIM)
@@ -1724,6 +2275,25 @@ struct Index {
                 .margin({ top: this.px(24) })
             }
             List({ scroller: this.modelsScroller }) {
+              if (this.chatKind === 'local') {
+                ForEach(this.apiProfiles, (profile: ApiProfile) => {
+                  ListItem() {
+                    Column() {
+                      Text((profile.id === this.selectedApiId ? '✓ ' : '') + profile.name)
+                        .fontSize(this.vp(10)).fontColor(profile.id === this.selectedApiId ? ACCENT : TEXT)
+                        .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                      Text(profile.model)
+                        .fontSize(this.vp(8)).fontColor(DIM).maxLines(1)
+                      Text(profile.baseUrl)
+                        .fontSize(this.vp(7)).fontColor(DIM).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                    }
+                    .alignItems(HorizontalAlign.Start)
+                    .width('100%')
+                    .padding({ top: this.px(6), bottom: this.px(6) })
+                    .onClick(() => { this.chooseApiProfile(profile.id); })
+                  }
+                }, (profile: ApiProfile) => profile.id)
+              } else {
               ForEach(this.modelOptions, (p: ProviderOption) => {
                 ForEach(p.models, (m: ModelOption) => {
                   ListItem() {
@@ -1743,6 +2313,7 @@ struct Index {
                   }
                 }, (m: ModelOption) => p.id + '/' + m.id)
               }, (p: ProviderOption) => p.id)
+              }
             }
             .layoutWeight(1)
             .width('100%')
@@ -1754,6 +2325,15 @@ struct Index {
             .onDigitalCrown((event: CrownEvent) => {
               this.handleCrown(this.modelsScroller, event);
             })
+            .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
+            .translate({ y: this.crownOffset(this.modelsScroller) })
+            if (this.chatKind === 'local') {
+              Text(this.apiProfiles.length === 0 ? '添加 API 配置' : '管理 API 配置')
+                .fontSize(this.vp(10)).fontColor(ACCENT).textAlign(TextAlign.Center)
+                .height(this.px(28)).width('100%').backgroundColor('#142126').borderRadius(this.px(14))
+                .margin({ top: this.px(3) })
+                .onClick(() => { this.closeModels(); this.openLocalSettings(); })
+            }
           }
           .width(this.px(176))
           .height(this.px(150))
@@ -1770,68 +2350,25 @@ struct Index {
     }
     .width('100%')
     .height('100%')
-    
+    .onAppear(() => { this.focusMainCrown(); })
+    .onDigitalCrown((event: CrownEvent) => { this.routeMainCrown(event); })
   }
 
   @Builder
   QuickView() {
-    Scroll() {
-      Column() {
-        Text('快捷')
-          .id('crown-quick')
-          .fontSize(this.vp(13))
-          .fontWeight(FontWeight.Medium)
-          .fontColor(TEXT)
-          .focusable(true)
-          .focusOnTouch(true)
-          .defaultFocus(true)
-        Text('抬手就能派活')
-          .fontSize(this.vp(7))
-          .fontColor(DIM)
-          .margin({ top: this.px(2), bottom: this.px(10) })
-        ForEach(this.presets, (item: Preset) => {
-          Row() {
-            Text(item.label)
-              .fontSize(this.vp(11))
-              .fontColor(TEXT)
-            Blank()
-            Text('›')
-              .fontSize(this.vp(13))
-              .fontColor(DIM)
-          }
-          .width('100%')
-          .height(this.px(42))
-          .padding({ left: this.px(16), right: this.px(14) })
-          .backgroundColor('#0D181C')
-          .borderRadius(this.px(21))
-          .margin({ top: this.px(7) })
-          .clickEffect({ level: ClickEffectLevel.LIGHT })
-          .onClick(() => { this.sendPreset(item.text); })
-        }, (item: Preset) => item.label)
-        Row() {
-          Text('新建会话')
-            .fontSize(this.vp(10))
-            .fontColor(ACCENT)
-        }
-        .width('100%')
-        .height(this.px(36))
-        .justifyContent(FlexAlign.Center)
-        .margin({ top: this.px(6) })
-        .clickEffect({ level: ClickEffectLevel.LIGHT })
-        .onClick(() => { this.doNew(); })
-      }
-      .width('100%')
-      .padding({ left: this.px(30), right: this.px(30), top: this.px(30), bottom: this.px(30) })
-    }
-    .width('100%')
-    .height('100%')
-    .scrollBar(BarState.Off)
-    .edgeEffect(EdgeEffect.Spring)
+    CrownMenu({ screenWidth: this.sw, title: '快捷',
+      focusId: 'crown-quick', items: this.quickItems,
+      onAction: (key: string) => {
+        if (this.chatKind === 'dsh' && this.token === '') { this.toast('先连接 DSH 宿主；独立对话请进控制中心'); return; }
+        if (key === 'new') { this.doNew(); return; }
+        const index: number = key === 'continue' ? 0 : (key === 'status' ? 1 : (key === 'summary' ? 2 : 3));
+        this.sendPreset(this.presets[index].text);
+      } })
   }
 
   @Builder
   ApprovalView() {
-    Scroll() {
+    Scroll(this.approvalScroller) {
       Column() {
         Text('操作确认')
           .id('crown-approval')
@@ -1882,77 +2419,20 @@ struct Index {
     .height('100%')
     .scrollBar(BarState.Off)
     .edgeEffect(EdgeEffect.Spring)
-  }
-
-  @Builder
-  MenuTile(label: string, caption: string, symbol: string, destination: string) {
-    Row() {
-      Text(symbol)
-        .fontSize(this.vp(12))
-        .fontColor(ACCENT)
-        .textAlign(TextAlign.Center)
-        .width(this.px(28))
-        .height(this.px(28))
-        .backgroundColor('#1B3335')
-        .borderRadius(this.px(14))
-        .margin({ right: this.px(9) })
-      Column() {
-        Text(label)
-          .fontSize(this.vp(11))
-          .fontWeight(FontWeight.Medium)
-          .fontColor(TEXT)
-        Text(caption)
-          .fontSize(this.vp(7))
-          .fontColor(DIM)
-          .margin({ top: this.px(1) })
-      }
-      .alignItems(HorizontalAlign.Start)
-      .layoutWeight(1)
-      Text('›')
-        .fontSize(this.vp(14))
-        .fontColor(DIM)
-        .margin({ left: this.px(4) })
-    }
-    .width('100%')
-    .height(this.px(44))
-    .padding({ left: this.px(8), right: this.px(13) })
-    .backgroundColor('#0D181C')
-    .borderRadius(this.px(22))
-    .margin({ top: this.px(7) })
-    .clickEffect({ level: ClickEffectLevel.LIGHT })
-    .onClick(() => {
-      if (destination === 'sessions') { this.openSessions(); }
-      else if (destination === 'guide') { this.showGuide = true; }
-      else { this.switchView(destination); }
-    })
+    .translate({ y: this.crownStretch })
   }
 
   @Builder
   MenuView() {
-    Scroll(this.menuScroller) {
-      Column() {
-        Text('控制中心')
-          .id('crown-menu')
-          .fontSize(this.vp(13))
-          .fontWeight(FontWeight.Medium)
-          .fontColor(TEXT)
-          .focusable(true)
-          .focusOnTouch(true)
-          .defaultFocus(true)
-          .onDigitalCrown((event: CrownEvent) => { this.handleCrown(this.menuScroller, event); })
-        this.MenuTile('会话', '回到正在进行的事', '≡', 'sessions')
-        this.MenuTile('设置', '连接与设备管理', '◇', 'settings')
-        this.MenuTile('诊断', '连接、轮询与缓存', '◎', 'diagnostics')
-        this.MenuTile('使用引导', '重新认识腕上 DSH', '?', 'guide')
-      }
-      .width('100%')
-      .padding({ left: this.px(43), right: this.px(43), top: this.px(37), bottom: this.px(34) })
-    }
-    .width('100%')
-    .height('100%')
-    .scrollBar(BarState.Off)
-    .edgeEffect(EdgeEffect.Spring)
-    
+    CrownMenu({ screenWidth: this.sw, title: '控制中心',
+      focusId: 'crown-menu', items: this.menuItems,
+      onAction: (key: string) => {
+        if (key === 'sessions') { this.openSessions(); }
+        else if (key === 'local-chat') { this.enterLocal(); }
+        else if (key === 'local') { this.openLocalSettings(); }
+        else if (key === 'guide') { this.swiperInitialIndex = this.pageIndex; this.showGuide = true; }
+        else { this.switchView(key); }
+      } })
   }
 
   @Builder
@@ -1982,6 +2462,7 @@ struct Index {
           .border({ width: 0.5, color: '#35B8E0D6' })
           .borderRadius(this.px(9))
           .margin({ top: this.px(4) })
+          .onEditChange((editing: boolean) => { this.editingInput = editing; })
           .onChange((v: string) => { this.lanEdit = v; })
         Text('外网地址')
           .fontSize(this.vp(7))
@@ -1998,6 +2479,7 @@ struct Index {
           .border({ width: 0.5, color: '#35B8E0D6' })
           .borderRadius(this.px(9))
           .margin({ top: this.px(4) })
+          .onEditChange((editing: boolean) => { this.editingInput = editing; })
           .onChange((v: string) => { this.remoteEdit = v; })
         TextInput({ placeholder: '6 位配对码', text: this.settingsCode })
           .type(InputType.Number)
@@ -2011,6 +2493,7 @@ struct Index {
           .border({ width: 0.5, color: '#35B8E0D6' })
           .borderRadius(this.px(9))
           .margin({ top: this.px(5) })
+          .onEditChange((editing: boolean) => { this.editingInput = editing; })
           .onChange((v: string) => { this.settingsCode = v; })
         Row() {
           Text('保存地址')
@@ -2098,13 +2581,6 @@ struct Index {
         .borderRadius(this.px(15))
         .clickEffect({ level: ClickEffectLevel.LIGHT })
         .onClick(() => { this.unbind(); })
-      Text('返回')
-        .fontSize(this.vp(9))
-        .fontColor(ACCENT)
-        .padding({ left: this.px(16), right: this.px(16), top: this.px(6), bottom: this.px(6) })
-        .margin({ top: this.px(5) })
-        .clickEffect({ level: ClickEffectLevel.LIGHT })
-        .onClick(() => { this.switchView('main'); })
     }
       .width('100%')
       .padding({ left: this.px(40), right: this.px(40), top: this.px(34), bottom: this.px(30) })
@@ -2113,6 +2589,7 @@ struct Index {
     .height('100%')
     .scrollBar(BarState.Off)
     .edgeEffect(EdgeEffect.Spring)
+    .translate({ y: this.crownStretch })
     .focusable(true)
     .onDigitalCrown((event: CrownEvent) => {
       this.handleCrown(this.settingsScroller, event);
@@ -2194,7 +2671,7 @@ struct Index {
           .defaultFocus(true)
           .onDigitalCrown((event: CrownEvent) => { this.handleCrown(this.diagScroller, event); })
         Column() {
-          this.DiagRow('版本', '2.0.38')
+          this.DiagRow('版本', '2.1.7')
           this.DiagRow('地址', this.server)
           this.DiagRow('链路', this.linkText())
           this.DiagRow('内网候选', this.lanUrl)
@@ -2275,13 +2752,6 @@ struct Index {
           .borderRadius(this.px(14))
           .clickEffect({ level: ClickEffectLevel.LIGHT })
           .onClick(() => { this.clearHistory(); })
-        Text('返回')
-          .fontSize(this.vp(9))
-          .fontColor(ACCENT)
-          .padding({ left: this.px(16), right: this.px(16), top: this.px(6), bottom: this.px(6) })
-          .margin({ top: this.px(5) })
-          .clickEffect({ level: ClickEffectLevel.LIGHT })
-          .onClick(() => { this.switchView('main'); })
       }
       .width('100%')
       .padding({ left: this.px(40), right: this.px(40), top: this.px(34), bottom: this.px(30) })
@@ -2290,6 +2760,7 @@ struct Index {
     .height('100%')
     .scrollBar(BarState.Off)
     .edgeEffect(EdgeEffect.Spring)
+    .translate({ y: this.crownStretch })
     .focusable(true)
     .onDigitalCrown((event: CrownEvent) => {
       this.handleCrown(this.diagScroller, event);
@@ -2298,77 +2769,8 @@ struct Index {
 
   @Builder
   SessionsView() {
-    Column() {
-      Row() {
-        Text('会话')
-          .id('crown-sessions')
-          .fontSize(this.vp(12))
-          .fontWeight(FontWeight.Medium)
-          .fontColor(TEXT)
-          .layoutWeight(1)
-          .focusable(true)
-          .focusOnTouch(true)
-          .defaultFocus(true)
-          .onDigitalCrown((event: CrownEvent) => { this.handleCrown(this.sessionsScroller, event); })
-        Text('+')
-          .fontSize(this.vp(17))
-          .fontColor(ACCENT)
-          .textAlign(TextAlign.Center)
-          .width(this.px(24))
-          .height(this.px(24))
-          .accessibilityText('新建会话')
-          .clickEffect({ level: ClickEffectLevel.LIGHT })
-          .onClick(() => { this.doNew(); })
-      }
-      .width('100%')
-      .height(this.px(27))
-      .padding({ left: this.px(40), right: this.px(40) })
-      .margin({ top: this.px(35), bottom: this.px(5) })
-      List({ scroller: this.sessionsScroller }) {
-        LazyForEach(this.sessionSource, (s: SessionInfo) => {
-          ListItem() {
-            Row() {
-              Circle({ width: this.vp(4), height: this.vp(4) })
-                .fill(s.running ? WARN : (s.live ? OK : DIM))
-                .margin({ right: this.px(8) })
-              Column() {
-                Text(s.title === '' ? s.id : s.title)
-                  .fontSize(this.vp(10))
-                  .fontColor(TEXT)
-                  .maxLines(1)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-                Text(s.running ? '执行中' : (s.live ? '在线 · 随时继续' : '已存档'))
-                  .fontSize(this.vp(7))
-                  .fontColor(DIM)
-                  .margin({ top: this.px(3) })
-              }
-              .alignItems(HorizontalAlign.Start)
-              .layoutWeight(1)
-              Text('›')
-                .fontSize(this.vp(14))
-                .fontColor(DIM)
-                .margin({ left: this.px(5) })
-            }
-            .width('100%')
-            .padding({ left: this.px(11), right: this.px(12), top: this.px(10), bottom: this.px(10) })
-            .backgroundColor(s.id === this.currentSessionId ? '#16302F' : '#0D181C')
-            .border({ width: s.id === this.currentSessionId ? 1 : 0, color: '#66ADE9D9' })
-            .borderRadius(this.px(24))
-          }
-          .padding({ bottom: this.px(5) })
-          .clickEffect({ level: ClickEffectLevel.LIGHT })
-          .onClick(() => { this.doSelect(s.id); })
-        }, (s: SessionInfo) => s.id)
-      }
-      .layoutWeight(1)
-      .width('100%')
-      .padding({ left: this.px(32), right: this.px(32), bottom: this.px(37) })
-      .scrollBar(BarState.Off)
-      .edgeEffect(EdgeEffect.Spring)
-      .focusable(false)
-    }
-    .width('100%')
-    .height('100%')
-    
+    CrownMenu({ screenWidth: this.sw, title: '会话', subtitle: '本地 API · DSH · 表冠滚动选择',
+      focusId: 'crown-sessions', items: this.pickerItems,
+      onAction: (key: string) => { this.pickSession(key).catch(() => { this.toast('切换前保存失败，请重试'); }); } })
   }
 }

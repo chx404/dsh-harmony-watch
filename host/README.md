@@ -1,4 +1,4 @@
-# dsh-watch（电脑端插件）
+# dsh-watch（DSH 宿主插件）
 
 跑在 DSH 进程里的最小 HTTP/SSE 服务，给手表 App / 浏览器用。
 
@@ -26,9 +26,21 @@
 图片：`GET /api/image?token=<token>&sessionId=<id>&seq=<事件序号>&i=<第几张>`，返回原图字节；
 拿不到附件（内存后端 / 已 offload）时返回 404，手表显示占位。
 
+## 独立 API 扫码配置（2.1.0）
+
+更新插件后需要重启 DSH 引擎。独立 API 聊天本身由手表直接请求服务商，不经过本插件。
+
+- `POST /api/direct-provision/start`：配对令牌请求五分钟临时票据；返回相对 `/configure#票据` 链接。
+- `GET /configure`：手机填写 HTTPS API 地址、Key、模型和 chat / responses 协议的页面；票据在 URL 片段中，不发送到页面请求路径。
+- `POST /api/direct-provision/submit`：手机凭临时票据提交，需通过同源校验；不会测试 API、不会连接提交的地址。
+- `POST /api/direct-provision/poll`：配对令牌读取配置，领取一次即销毁；返回内容只是草稿，手表需人工确认保存。
+- `DELETE /api/direct-provision`：配对令牌撤销票据。
+
+票据和配置仅存内存，最多八张；五分钟到期或插件卸载时清除。配置路由不继承普通接口的宽松 CORS，设有 CSP、禁止缓存/引用来源、JSON 类型与 16KiB 请求体限制。Key 不进入状态、日志、SSE 或磁盘。HTTP 配置链路仍可被同网段窃听或篡改，优先使用 HTTPS；不要分享二维码。
+
 ## 兼容性
 
-- 在 DSH `0.1.0-rc.6`（CLI）与 `0.2.0-rc.2`（桌面端同版本运行时）上实测通过；
+- 旧功能仅在 Android dsh-go 的 proot 环境、DSH `0.2.1-rc.4` 实机验证；未做 Windows / macOS 桌面端实机验证。新增扫码配置已做真实本机 HTTP 集成测试，手表端仍需设备验证；
 - 只用公开的 Cordis 事件与 Service：`approval` / `agents` / `sessions` / `sessionPersistence` /
   `agentPresets` / `agentDefaultModel` / `sessionTitle`，缺哪个就降级（不加载就报错）。
 
