@@ -47,8 +47,8 @@ test('标题绿点只在顶栏，消息停止和模型只在底栏，不混在�
 test('上下操作层不再绘制整片背景，按钮本身底色和淡出布局保留',()=>{
  assert.doesNotMatch(page,/CHAT_CHROME_BG/);
  const buttons=main.slice(footer.open,footer.close);
- assert.match(buttons,/\.backgroundColor\('#0D181C'\)/);
- assert.match(buttons,/'#282126'/);
+ assert.match(buttons,/\.backgroundColor\('#181818'\)/);
+ assert.match(buttons,/'#232323'/);
  const top=styles('chat-header',footer.open),bottom=styles('chat-footer',overlay.close);
  assert.match(top,/\.height\(this.px\(48\)\)/);
  for(const section of [top,bottom]){

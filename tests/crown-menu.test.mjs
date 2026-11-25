@@ -40,7 +40,7 @@ test('控制中心与快捷共用大胶囊、绝对偏移，表冠焦点落在�
   assert.match(component, /onDigitalCrown/);
   assert.match(page, /focusId: 'crown-quick', items: this.quickItems/);
   assert.match(page, /focusId: 'crown-menu', items: this.menuItems/);
-  assert.doesNotMatch(page.slice(page.indexOf('private goPage'), page.indexOf('private edgeOpacity')), /crown-sessions/);
+  assert.match(page, /if \(index === SESSION_PANEL\) \{ return 'crown-sessions';/);
   assert.match(page, /LocalChat\(\{ screenWidth/);
   assert.match(page, /this.view !== 'local'/);
 });

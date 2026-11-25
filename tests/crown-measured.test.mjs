@@ -45,7 +45,8 @@ test('移除多余入口、简化会话名称，模型小窗只展示配置摘�
   const page=await readFile(new URL('../watch-app/entry/src/main/ets/pages/Index.ets',import.meta.url),'utf8');
   const menu=page.slice(page.indexOf('private menuItems:'),page.indexOf('private quickItems:'));
   assert.doesNotMatch(menu,/独立对话|全部会话/);
-  assert.match(menu,/title: '会话'/);
+  assert.doesNotMatch(menu,/title: '会话'/);
+  assert.match(page,/this\.MenuView\(\)\s*this\.SessionsView\(\)\s*this\.MainView\(\)/);
   assert.match(page,/ForEach\(this.apiProfiles/);
   assert.match(page,/onProfileConfigured:/);
   assert.match(page,/chooseApiProfile\(profile.id\)/);

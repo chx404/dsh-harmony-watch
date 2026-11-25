@@ -17,11 +17,11 @@ const js=compile(`class Harness { ${methods.map(extract).join('\n')} }`);
 const TouchType={Down:0,Up:1,Move:2,Cancel:3}, CrownAction={BEGIN:0,UPDATE:1,END:2};
 function fixture() {
   const timers=new Map(), animations=[], edges=[], focus={ok:true,requests:[]}; let next=0;
-  const Harness=new Function('animateTo','Curve','TouchType','CrownAction','setTimeout','clearTimeout',js+';return Harness;')(
-    (options, action)=>{animations.push(options.duration);action();}, {EaseOut:'out'},TouchType,CrownAction,
+  const Harness=new Function('CHAT_PANEL','animateTo','Curve','TouchType','CrownAction','setTimeout','clearTimeout',js+';return Harness;')(
+    2,(options, action)=>{animations.push(options.duration);action();}, {EaseOut:'out'},TouchType,CrownAction,
     callback=>{const id=++next;timers.set(id,callback);return id;}, id=>timers.delete(id));
   const h=new Harness();
-  Object.assign(h,{view:'main',pageIndex:1,showPrompt:false,showModels:false,showGuide:false,pageVisible:true,returnAnimating:false,
+  Object.assign(h,{view:'main',pageIndex:2,showPrompt:false,showModels:false,showGuide:false,pageVisible:true,returnAnimating:false,
     chatChromeHidden:false,chatChromeProgress:0,chatCrownQuietTimer:-1,chatFocusTimer:-1,chatScrollOrigin:0,px:v=>v,
     resetCrown(){this.crownOwner=undefined;},
     getUIContext:()=>({getFocusController:()=>({requestFocus(id){focus.requests.push(id);}})}),
@@ -44,7 +44,7 @@ test('横向Swiper与被系统取消不会留下隐藏状态',()=>{
  touch(h,TouchType.Cancel);touch(h,TouchType.Move,40,200);assert.equal(h.chatChromeHidden,false);
 });
 test('模型/输入浮层、缓存页和后台不进入沉浸状态',()=>{
- for(const change of [{showModels:true},{showPrompt:true},{pageIndex:0},{pageIndex:2},{pageVisible:false},{view:'settings'},{returnAnimating:true}]){
+ for(const change of [{showModels:true},{showPrompt:true},{pageIndex:0},{pageIndex:1},{pageVisible:false},{view:'settings'},{returnAnimating:true}]){
   const {h,timers}=fixture();Object.assign(h,change);touch(h,TouchType.Down);touch(h,TouchType.Move,40,100);crown(h,CrownAction.UPDATE);
   assert.equal(h.chatChromeHidden,false,JSON.stringify(change));assert.equal(timers.size,0);
  }

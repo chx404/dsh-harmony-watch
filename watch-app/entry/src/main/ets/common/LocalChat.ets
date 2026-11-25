@@ -1,23 +1,21 @@
 import common from '@ohos.app.ability.common';
 import {
   DirectApiConfig, DirectConfigStore, DirectConversation, DirectMessage,
-  DirectStoredConfig, copyDirectConfig, validateDirectConfig, normalizeDirectProvisionHost, directProvisionQrLink
+  DirectStoredConfig, copyDirectConfig, validateDirectConfig
 } from './DirectApi';
-import { ProvisionTicket, startDirectProvision, pollDirectProvision, cancelDirectProvision } from './DirectProvision';
+import { WatchProvisionService } from './WatchProvisionService';
 import { CrownElastic } from './CrownElastic';
 import { CrownMenu, CrownMenuItem } from './CrownMenu';
 import { ApiProfile, ApiProfilesSnapshot, ApiProfileStore } from './ApiProfiles';
 
-const DIRECT_TEXT: string = '#EDF4F3';
-const DIRECT_DIM: string = '#9BAFB3';
-const DIRECT_MINT: string = '#ADE9D9';
+const DIRECT_TEXT: string = '#F4F4F4';
+const DIRECT_DIM: string = '#B5B5B5';
+const DIRECT_ACCENT: string = '#F5F5F5';
 
 @Component
 export struct LocalChat {
   @Prop screenWidth: number = 233;
   @Prop screenHeight: number = 233;
-  @Prop hostBase: string = '';
-  @Prop hostToken: string = '';
   @Prop settingsOnly: boolean = false;
   @Prop profileId: string = '';
   @Prop @Watch('backRequested') backRequest: number = 0;
@@ -50,6 +48,10 @@ export struct LocalChat {
   @State storageNotice: string = '';
   @State qrValue: string = '';
   @State qrBusy: boolean = false;
+  @State pendingEndpoint: string = '';
+  @State pendingModel: string = '';
+  @State pendingProtocol: string = '';
+  private pendingImport?: DirectApiConfig;
   @State imported: boolean = false;
   @State clearArmed: boolean = false;
   @State saveArmed: boolean = false;
@@ -63,13 +65,10 @@ export struct LocalChat {
   private uiGeneration: number = 0;
   private provisionGeneration: number = 0;
   private provisionTimer: number = -1;
-  private provisionExpiry: number = -1;
-  private ticket?: ProvisionTicket;
-  private ticketBase: string = '';
-  private ticketToken: string = '';
-  private ticketDeadline: number = 0;
+  private watchProvision?: WatchProvisionService;
   private scroll: Scroller = new Scroller();
   private settingsScroll: Scroller = new Scroller();
+  private provisionScroll: Scroller = new Scroller();
   private focusTimer: number = -1;
 
   private pageChanged(): void {
@@ -83,7 +82,8 @@ export struct LocalChat {
   }
 
   private handleCrown(event: CrownEvent): void {
-    if (this.appInBackground || this.loading || this.inputEditing || (this.page !== 'settings' && this.page !== 'chat')) {
+    if (this.appInBackground || this.loading || this.inputEditing ||
+      (this.page !== 'settings' && this.page !== 'chat' && this.page !== 'qr' && this.page !== 'confirm')) {
       this.crownMotion.cancel();
       return;
     }
@@ -91,7 +91,8 @@ export struct LocalChat {
     if (event.action === CrownAction.END) { this.crownMotion.end(); return; }
     if (event.action !== CrownAction.UPDATE) { return; }
     try {
-      const scroller: Scroller = this.page === 'settings' ? this.settingsScroll : this.scroll;
+      const scroller: Scroller = this.page === 'settings' ? this.settingsScroll :
+        (this.page === 'qr' || this.page === 'confirm' ? this.provisionScroll : this.scroll);
       const offset: number = scroller.currentOffset().yOffset;
       const next: number = this.crownMotion.updateAtEdges(-event.degree * this.u(2.2), offset,
         offset <= 0.5, scroller.isAtEnd());
@@ -123,6 +124,7 @@ export struct LocalChat {
     this.uiGeneration++;
     this.conversation.cancel();
     this.stopProvision();
+    this.clearPhoneImport();
     this.keyDraft = '';
     this.activeConfig = undefined;
   }
@@ -132,9 +134,10 @@ export struct LocalChat {
       this.crownMotion.cancel();
       this.stopProvision();
       this.stopSend();
-      if (this.page === 'qr') {
+      if (this.page === 'qr' || this.page === 'confirm') {
+        this.clearPhoneImport();
         this.page = 'settings';
-        this.status = '已暂停扫码；回到前台后可重新生成';
+        this.status = '已关闭临时配置服务；回到前台后可重新生成';
       }
     }
   }
@@ -284,8 +287,9 @@ export struct LocalChat {
 
   private closePage(): void {
     if (this.saving || this.inputEditing) { return; }
-    if (this.page === 'qr') {
+    if (this.page === 'qr' || this.page === 'confirm') {
       this.stopProvision();
+      this.clearPhoneImport();
       this.returnTo('settings');
       this.status = '';
     } else if (this.settingsOnly) {
@@ -509,106 +513,98 @@ export struct LocalChat {
   private stopProvision(): void {
     this.provisionGeneration++;
     if (this.provisionTimer >= 0) { clearTimeout(this.provisionTimer); this.provisionTimer = -1; }
-    if (this.provisionExpiry >= 0) { clearTimeout(this.provisionExpiry); this.provisionExpiry = -1; }
-    const ticket: ProvisionTicket | undefined = this.ticket;
-    const base: string = this.ticketBase;
-    const token: string = this.ticketToken;
-    this.ticket = undefined;
-    this.ticketBase = '';
-    this.ticketToken = '';
+    this.watchProvision?.stop();
+    this.watchProvision = undefined;
     this.qrValue = '';
     this.qrBusy = false;
-    if (ticket) { cancelDirectProvision(base, token, ticket.id).catch(() => {}); }
+  }
+
+  private clearPhoneImport(): void {
+    this.pendingImport = undefined;
+    this.pendingEndpoint = '';
+    this.pendingModel = '';
+    this.pendingProtocol = '';
   }
 
   private async beginProvision(): Promise<void> {
     if (this.loading || this.saving || this.qrBusy || this.appInBackground) { return; }
-    if (!this.hostBase || !this.hostToken) {
-      this.status = '扫码需先与 DSH 宿主配对；也可直接手动填写';
-      return;
-    }
     this.stopProvision();
+    this.clearPhoneImport();
     const generation: number = this.provisionGeneration;
-    let base: string;
-    try { base = normalizeDirectProvisionHost(this.hostBase); } catch (_) { this.status = '宿主地址无效，请手动配置'; return; }
-    const token: string = this.hostToken;
-    // A phone import is always a new draft, even when opened while editing an existing API.
+    // Phone imports always create a new draft, never replace another saved API.
     if (this.settingsOnly) { this.discardDraft(); }
     this.qrBusy = true;
     this.page = 'qr';
-    this.status = '生成一次性配置链接…';
+    this.status = '正在手表上生成链接，不连接 DSH 宿主…';
+    const service = new WatchProvisionService((config: DirectApiConfig) => {
+      this.receivePhoneImport(config, generation);
+    }, (notice: string) => {
+      if (!this.alive || this.appInBackground || generation !== this.provisionGeneration) { return; }
+      this.stopProvision(); this.page = 'qr'; this.status = notice;
+    });
+    this.watchProvision = service;
+    this.provisionTimer = setTimeout(() => {
+      if (!this.alive || generation !== this.provisionGeneration) { return; }
+      this.stopProvision(); this.page = 'qr'; this.status = '启动超时，请确认手表已连接 Wi-Fi 后重试';
+    }, 15000);
     try {
-      const ticket: ProvisionTicket = await startDirectProvision(base, token);
+      const link = await service.start();
       if (!this.alive || this.appInBackground || generation !== this.provisionGeneration) {
-        cancelDirectProvision(base, token, ticket.id).catch(() => {});
-        return;
+        service.stop(); return;
       }
-      this.ticket = ticket;
-      this.ticketBase = base;
-      this.ticketToken = token;
-      const link: string = directProvisionQrLink(base, ticket.pagePath, ticket.id, ticket.expiresAt);
-      if (ticket.pagePath.indexOf(token) >= 0 ||
-        (this.keyDraft.length > 0 && ticket.pagePath.indexOf(this.keyDraft) >= 0)) {
-        throw new Error('配置链接无效');
-      }
-      this.ticketDeadline = Math.min(ticket.expiresAt, Date.now() + 300000);
-      this.qrValue = link;
+      if (this.provisionTimer >= 0) { clearTimeout(this.provisionTimer); this.provisionTimer = -1; }
+      this.qrValue = link.url;
       this.qrBusy = false;
-      this.status = '手机扫码，5 分钟内有效；勿转发';
-      this.provisionExpiry = setTimeout(() => {
-        if (generation !== this.provisionGeneration) { return; }
-        this.stopProvision();
-        this.page = 'settings';
-        this.status = '一次性链接已过期，可重新生成';
-      }, this.ticketDeadline - Date.now());
-      this.pollProvision(generation);
+      this.status = '手机与手表同一 Wi-Fi，扫码直连手表；5 分钟有效，保持此页';
     } catch (error) {
       if (this.alive && generation === this.provisionGeneration) {
-        this.stopProvision();
-        this.page = 'settings';
-        this.status = (error as Error).message === '需更新并重启宿主' ? '需更新并重启宿主；仍可手动填写' : '无法开启扫码配置；请检查宿主或手动填写';
+        this.stopProvision(); this.page = 'qr';
+        this.status = (error as Error).message || '无法开启手表配置页，请检查手表 Wi-Fi 后重试';
       }
     }
   }
 
-  private async pollProvision(generation: number): Promise<void> {
-    if (!this.alive || this.appInBackground || generation !== this.provisionGeneration || !this.ticket) { return; }
-    if (Date.now() >= this.ticketDeadline) {
-      this.stopProvision(); this.page = 'settings'; this.status = '一次性链接已过期'; return;
-    }
-    const ticket: ProvisionTicket = this.ticket;
+  private receivePhoneImport(config: DirectApiConfig, generation: number): void {
+    if (!this.alive || this.appInBackground || generation !== this.provisionGeneration) { return; }
     try {
-      const result = await pollDirectProvision(this.ticketBase, this.ticketToken, ticket.id);
-      if (!this.alive || this.appInBackground || generation !== this.provisionGeneration) { return; }
-      if (result.config && result.status === 'ready') {
-        const checked: DirectApiConfig = validateDirectConfig(result.config);
-        this.stopProvision();
-        if (this.settingsOnly) { this.discardDraft(); }
-        this.fillDraft(checked);
-        this.imported = true;
-        this.clearArmed = false;
-        this.saveArmed = false;
-        this.page = 'settings';
-        this.status = this.settingsOnly ? '手机配置是新草稿，尚未启用；核对后保存并返回主聊天，不覆盖其他 API' : '手机配置待核对：确认地址、模型及协议后，点「保存并新建」；尚未启用';
-        return;
-      }
-      if (result.status !== 'pending') {
-        this.stopProvision(); this.page = 'settings'; this.status = '扫码已结束或过期，可重新生成'; return;
-      }
-      this.provisionTimer = setTimeout(() => { this.pollProvision(generation); }, 1800);
+      const checked: DirectApiConfig = validateDirectConfig(config);
+      this.stopProvision();
+      this.pendingImport = checked;
+      this.pendingEndpoint = checked.baseUrl;
+      this.pendingModel = checked.model;
+      this.pendingProtocol = checked.protocol;
+      this.status = '';
+      this.page = 'confirm';
     } catch (_) {
-      if (this.alive && generation === this.provisionGeneration) {
-        this.stopProvision(); this.page = 'settings'; this.status = '扫码连接中断或配置无效；请手动核对后重试';
-      }
+      this.stopProvision(); this.page = 'qr'; this.status = '手机配置无效，请重新扫码填写';
     }
+  }
+
+  private confirmPhoneImport(): void {
+    if (this.appInBackground || this.page !== 'confirm' || !this.pendingImport) { return; }
+    const checked: DirectApiConfig = this.pendingImport;
+    this.clearPhoneImport();
+    if (this.settingsOnly) { this.discardDraft(); }
+    this.fillDraft(checked);
+    this.imported = true;
+    this.clearArmed = false;
+    this.saveArmed = false;
+    this.page = 'settings';
+    this.status = this.settingsOnly ? '手机配置是新草稿，尚未启用；核对后保存并返回主聊天，不覆盖其他 API' : '手机配置待核对：确认地址、模型及协议后，点「保存并新建」；尚未启用';
+  }
+
+  private rejectPhoneImport(): void {
+    this.clearPhoneImport();
+    this.returnTo('settings');
+    this.status = '已放弃手机配置，未保存 API Key';
   }
 
   @Builder
   Pill(label: string, action: () => void, accent: boolean = false) {
     Button(label, { type: ButtonType.Capsule })
       .fontSize(this.u(11))
-      .fontColor(accent ? '#102D29' : DIRECT_MINT)
-      .backgroundColor(accent ? DIRECT_MINT : '#080E12')
+      .fontColor(accent ? '#111111' : DIRECT_ACCENT)
+      .backgroundColor(accent ? DIRECT_ACCENT : '#131313')
       .height(this.u(36))
       .width('100%')
       .onClick(action)
@@ -625,54 +621,54 @@ export struct LocalChat {
     Scroll(this.settingsScroll) {
       Column({ space: this.u(10) }) {
         Text(this.imported ? '核对手机新草稿' : this.settingsOnly ? (this.editingProfileId ? '编辑已保存 API' : '新增 API') : '连接独立 API')
-          .fontSize(this.u(12)).fontWeight(FontWeight.Medium).fontColor(this.imported ? '#EFC49A' : DIRECT_TEXT)
+          .fontSize(this.u(12)).fontWeight(FontWeight.Medium).fontColor(this.imported ? '#DFDFDF' : DIRECT_TEXT)
         Button(this.qrBusy ? '准备中…' : '手机填写', { type: ButtonType.Capsule })
           .height(this.u(40)).width('100%').fontSize(this.u(12))
-          .backgroundColor(!this.configured ? DIRECT_MINT : '#080E12')
-          .fontColor(!this.configured ? '#102D29' : DIRECT_MINT)
+          .backgroundColor(!this.configured ? DIRECT_ACCENT : '#131313')
+          .fontColor(!this.configured ? '#111111' : DIRECT_ACCENT)
           .enabled(!this.loading && !this.saving && !this.qrBusy)
           .onClick(() => { this.draftChanged(); this.beginProvision(); })
         this.Note(this.settingsOnly ? '扫码另建新草稿；或在手表填写' : '或在手表填写')
         if (this.settingsOnly) {
           Column({ space: this.u(6) }) {
-            Text('API 名称').fontSize(this.u(11)).fontColor(DIRECT_MINT).alignSelf(ItemAlign.Start)
+            Text('API 名称').fontSize(this.u(11)).fontColor(DIRECT_ACCENT).alignSelf(ItemAlign.Start)
             TextInput({ placeholder: '便于识别的名称', text: this.nameDraft })
-              .fontSize(this.u(10)).height(this.u(40)).backgroundColor('#080E12').fontColor(DIRECT_TEXT).borderRadius(this.u(20))
+              .fontSize(this.u(10)).height(this.u(40)).backgroundColor('#131313').fontColor(DIRECT_TEXT).borderRadius(this.u(20))
               .enabled(!this.saving).maxLength(80).enableAutoFill(false)
               .onChange((value: string) => { this.nameDraft = value; this.draftChanged(); })
               .onEditChange((editing: boolean) => { this.editingChanged(editing); })
           }.width('100%').alignItems(HorizontalAlign.Start)
         }
         Column({ space: this.u(6) }) {
-          Text('API 地址 · HTTPS').fontSize(this.u(11)).fontColor(DIRECT_MINT).alignSelf(ItemAlign.Start)
+          Text('API 地址 · HTTPS').fontSize(this.u(11)).fontColor(DIRECT_ACCENT).alignSelf(ItemAlign.Start)
           TextInput({ placeholder: 'https://api.example.com/v1', text: this.baseDraft })
-            .fontSize(this.u(10)).height(this.u(40)).backgroundColor('#080E12').fontColor(DIRECT_TEXT).borderRadius(this.u(20))
+            .fontSize(this.u(10)).height(this.u(40)).backgroundColor('#131313').fontColor(DIRECT_TEXT).borderRadius(this.u(20))
             .enabled(!this.saving).maxLength(2048).enableAutoFill(false)
             .onChange((value: string) => { this.baseDraft = value; this.draftChanged(); })
             .onEditChange((editing: boolean) => { this.editingChanged(editing); })
-          Text('模型').fontSize(this.u(11)).fontColor(DIRECT_MINT).alignSelf(ItemAlign.Start)
+          Text('模型').fontSize(this.u(11)).fontColor(DIRECT_ACCENT).alignSelf(ItemAlign.Start)
           TextInput({ placeholder: '模型名称', text: this.modelDraft })
-            .fontSize(this.u(10)).height(this.u(40)).backgroundColor('#080E12').fontColor(DIRECT_TEXT).borderRadius(this.u(20))
+            .fontSize(this.u(10)).height(this.u(40)).backgroundColor('#131313').fontColor(DIRECT_TEXT).borderRadius(this.u(20))
             .enabled(!this.saving).maxLength(200).enableAutoFill(false)
             .onChange((value: string) => { this.modelDraft = value; this.draftChanged(); })
             .onEditChange((editing: boolean) => { this.editingChanged(editing); })
-          Text('API Key · 始终隐藏').fontSize(this.u(11)).fontColor(DIRECT_MINT).alignSelf(ItemAlign.Start)
+          Text('API Key · 始终隐藏').fontSize(this.u(11)).fontColor(DIRECT_ACCENT).alignSelf(ItemAlign.Start)
           TextInput({ placeholder: 'API Key', text: this.keyDraft })
             .type(InputType.Password).showPasswordIcon(false).showPassword(false).copyOption(CopyOptions.None).enableAutoFill(false)
-            .fontSize(this.u(10)).height(this.u(40)).backgroundColor('#080E12').fontColor(DIRECT_TEXT).borderRadius(this.u(20))
+            .fontSize(this.u(10)).height(this.u(40)).backgroundColor('#131313').fontColor(DIRECT_TEXT).borderRadius(this.u(20))
             .enabled(!this.saving).maxLength(8192)
             .onChange((value: string) => { this.keyDraft = value; this.draftChanged(); })
             .onEditChange((editing: boolean) => { this.editingChanged(editing); })
         }.width('100%').alignItems(HorizontalAlign.Start)
         Column({ space: this.u(6) }) {
-          Text('请求协议').fontSize(this.u(11)).fontColor(DIRECT_MINT).alignSelf(ItemAlign.Start)
+          Text('请求协议').fontSize(this.u(11)).fontColor(DIRECT_ACCENT).alignSelf(ItemAlign.Start)
           Button(this.protocolDraft === 'chat' ? '✓ Chat Completions' : '○ Chat Completions', { type: ButtonType.Capsule })
-            .fontSize(this.u(10)).height(this.u(36)).width('100%').fontColor(this.protocolDraft === 'chat' ? '#102D29' : DIRECT_DIM)
-            .backgroundColor(this.protocolDraft === 'chat' ? DIRECT_MINT : '#080E12').enabled(!this.saving)
+            .fontSize(this.u(10)).height(this.u(36)).width('100%').fontColor(this.protocolDraft === 'chat' ? '#111111' : DIRECT_DIM)
+            .backgroundColor(this.protocolDraft === 'chat' ? DIRECT_ACCENT : '#131313').enabled(!this.saving)
             .onClick(() => { this.protocolDraft = 'chat'; this.draftChanged(); })
           Button(this.protocolDraft === 'responses' ? '✓ Responses' : '○ Responses', { type: ButtonType.Capsule })
-            .fontSize(this.u(10)).height(this.u(36)).width('100%').fontColor(this.protocolDraft === 'responses' ? '#102D29' : DIRECT_DIM)
-            .backgroundColor(this.protocolDraft === 'responses' ? DIRECT_MINT : '#080E12').enabled(!this.saving)
+            .fontSize(this.u(10)).height(this.u(36)).width('100%').fontColor(this.protocolDraft === 'responses' ? '#111111' : DIRECT_DIM)
+            .backgroundColor(this.protocolDraft === 'responses' ? DIRECT_ACCENT : '#131313').enabled(!this.saving)
             .onClick(() => { this.protocolDraft = 'responses'; this.draftChanged(); })
         }.width('100%')
         this.Note(this.settingsOnly ? 'Key 明文保存在应用私有空间，仅用于 API 鉴权，不进入链接或日志' : 'Key 仅用于 API 鉴权，不进入链接或日志')
@@ -686,7 +682,7 @@ export struct LocalChat {
           this.Note('仅删除当前 API，不删除其他 API 或本地会话')
           this.Pill(this.clearArmed ? '确认删除当前 API' : '删除当前 API', () => { this.clearConfig(); })
         }
-        this.Note('扫码优先 HTTPS；HTTP 仅在同一可信 WiFi 使用，链接勿转发')
+        this.Note('配置页为 HTTP，仅在同一可信 WiFi 使用，链接勿转发；无需连接宿主')
         Blank().height(this.u(24))
       }.width(this.u(168)).padding({ top: this.u(62), bottom: this.u(88) })
         .translate({ y: this.crownStretch })
@@ -701,9 +697,9 @@ export struct LocalChat {
     Column({ space: this.u(5) }) {
       Row({ space: this.u(6) }) {
         Button('设置', { type: ButtonType.Capsule }).height(this.u(30)).width(this.u(70))
-          .fontSize(this.u(11)).fontColor(DIRECT_MINT).backgroundColor('#080E12').onClick(() => { this.openSettings(); })
+          .fontSize(this.u(11)).fontColor(DIRECT_ACCENT).backgroundColor('#131313').onClick(() => { this.openSettings(); })
         Button('新建', { type: ButtonType.Capsule }).height(this.u(30)).width(this.u(70))
-          .fontSize(this.u(11)).fontColor(DIRECT_MINT).backgroundColor('#080E12').onClick(() => { this.newChat(); })
+          .fontSize(this.u(11)).fontColor(DIRECT_ACCENT).backgroundColor('#131313').onClick(() => { this.newChat(); })
       }
       Scroll(this.scroll) {
         Column({ space: this.u(8) }) {
@@ -712,10 +708,10 @@ export struct LocalChat {
           }
           ForEach(this.messages, (message: DirectMessage, index: number) => {
             Column({ space: this.u(3) }) {
-              Text(message.role === 'user' ? '你' : 'API').fontSize(this.u(9)).fontColor(DIRECT_MINT)
+              Text(message.role === 'user' ? '你' : 'API').fontSize(this.u(9)).fontColor(DIRECT_ACCENT)
               Text(message.content).fontSize(this.u(12)).lineHeight(this.u(17)).fontColor(DIRECT_TEXT).width('100%')
             }.alignItems(HorizontalAlign.Start).width('100%').padding(this.u(9))
-              .backgroundColor(message.role === 'user' ? '#16332F' : '#101C22').borderRadius(this.u(12))
+              .backgroundColor(message.role === 'user' ? '#2D2D2D' : '#1A1A1A').borderRadius(this.u(12))
           }, (message: DirectMessage, index: number) => index.toString() + ':' + message.role)
           if (this.busy) {
             this.Note('发送中：' + this.pendingText.slice(0, 80))
@@ -726,7 +722,7 @@ export struct LocalChat {
       }.width(this.u(182)).height(this.u(67)).scrollBar(BarState.Off)
         .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
         .onAppear(() => { this.pageChanged(); })
-      Row().width(this.u(148)).height(this.u(1)).backgroundColor('#213A3B')
+      Row().width(this.u(148)).height(this.u(1)).backgroundColor('#353535')
       Column() {
         if (this.busy) {
           this.Pill('停止', () => { this.stopSend(); }, true)
@@ -741,7 +737,7 @@ export struct LocalChat {
   Compose() {
     Column({ space: this.u(8) }) {
       TextArea({ placeholder: '消息只发给独立 API', text: this.prompt })
-        .fontSize(this.u(13)).fontColor(DIRECT_TEXT).backgroundColor('#101C22')
+        .fontSize(this.u(13)).fontColor(DIRECT_TEXT).backgroundColor('#1A1A1A')
         .height(this.u(102)).width(this.u(164)).maxLength(2000).enableAutoFill(false)
         .onChange((value: string) => { this.prompt = value; })
         .onEditChange((editing: boolean) => { this.editingChanged(editing); })
@@ -752,18 +748,48 @@ export struct LocalChat {
 
   @Builder
   Provision() {
-    Column({ space: this.u(4) }) {
-      if (this.qrValue) {
-        QRCode(this.qrValue).width(this.u(104)).height(this.u(104)).color('#000000').backgroundColor('#FFFFFF')
-          .padding(this.u(6)).borderRadius(this.u(5))
-      } else {
-        Text('生成中…').fontSize(this.u(13)).fontColor(DIRECT_MINT).height(this.u(105))
-      }
-      Text(this.status).fontSize(this.u(9)).lineHeight(this.u(12)).fontColor(DIRECT_DIM)
-        .width(this.u(166)).textAlign(TextAlign.Center).maxLines(2)
-      Text('仅配置时需宿主；聊天由手表直连').fontSize(this.u(8)).fontColor(DIRECT_MINT)
-        .width(this.u(166)).textAlign(TextAlign.Center)
-    }.width(this.u(176)).height(this.u(147))
+    Scroll(this.provisionScroll) {
+      Column({ space: this.u(6) }) {
+        if (this.qrValue) {
+          Column() {
+            QRCode(this.qrValue).width(this.u(116)).height(this.u(116))
+              .color('#000000').backgroundColor('#FFFFFF')
+          }.padding(this.u(7)).backgroundColor('#FFFFFF').borderRadius(this.u(5))
+        } else {
+          Text(this.qrBusy ? '生成中…' : '未开启配置页').fontSize(this.u(12)).fontColor(DIRECT_ACCENT)
+        }
+        Text(this.status).fontSize(this.u(10)).lineHeight(this.u(14)).fontColor(DIRECT_DIM)
+          .width(this.u(166)).textAlign(TextAlign.Center)
+        Text('无需宿主或配对 · 手机直连手表').fontSize(this.u(9)).fontColor(DIRECT_ACCENT)
+          .width(this.u(166)).textAlign(TextAlign.Center)
+        Text('HTTP 仅限可信 Wi-Fi；不要转发二维码').fontSize(this.u(8)).fontColor('#DFDFDF')
+          .width(this.u(164)).textAlign(TextAlign.Center)
+        if (!this.qrValue && !this.qrBusy) {
+          this.Pill('重新生成', () => { this.beginProvision(); }, true)
+        }
+      }.width(this.u(168)).padding({ top: this.u(58), bottom: this.u(45) })
+        .translate({ y: this.crownStretch })
+    }.width('100%').height('100%').scrollBar(BarState.Off)
+      .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
+  }
+
+  @Builder
+  ConfirmPhoneImport() {
+    Scroll(this.provisionScroll) {
+      Column({ space: this.u(10) }) {
+        Text('核对手机提交的 API').fontSize(this.u(12)).fontColor(DIRECT_TEXT)
+        Text(this.pendingEndpoint).fontSize(this.u(11)).fontColor(DIRECT_ACCENT)
+          .width('100%').wordBreak(WordBreak.BREAK_ALL).copyOption(CopyOptions.None)
+        Text('模型：' + this.pendingModel).fontSize(this.u(10)).fontColor(DIRECT_DIM)
+          .width('100%').wordBreak(WordBreak.BREAK_ALL)
+        Text('协议：' + this.pendingProtocol).fontSize(this.u(10)).fontColor(DIRECT_DIM)
+        this.Note('确认前不保存、不请求 API；确认后仍需点保存')
+        this.Pill('地址正确，继续', () => { this.confirmPhoneImport(); }, true)
+        this.Pill('放弃这次配置', () => { this.rejectPhoneImport(); })
+      }.width(this.u(168)).padding({ top: this.u(62), bottom: this.u(55) })
+        .translate({ y: this.crownStretch })
+    }.width('100%').height('100%').scrollBar(BarState.Off)
+      .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
   }
 
   build() {
@@ -786,9 +812,9 @@ export struct LocalChat {
       } else if (this.page === 'settings') {
         this.Settings()
       } else if (this.page === 'qr') {
-        Column() { this.Provision() }
-          .width('100%').height('100%').justifyContent(FlexAlign.Center)
-          .transition(TransitionEffect.OPACITY.combine(TransitionEffect.translate({ x: this.u(12) })))
+        this.Provision()
+      } else if (this.page === 'confirm') {
+        this.ConfirmPhoneImport()
       } else if (!this.settingsOnly && this.page === 'compose') {
         Column() { this.Compose() }.width('100%').height('100%').justifyContent(FlexAlign.Center)
           .transition(TransitionEffect.OPACITY)
@@ -798,15 +824,15 @@ export struct LocalChat {
       }
       if (this.page !== 'profiles') {
         // Transparent overlay: content keeps the full viewport and scrolls behind this title.
-        Text(this.page === 'qr' ? '扫码配置' : this.page === 'settings' ? 'API设置' : '独立 API')
+        Text(this.page === 'qr' ? '直连扫码' : this.page === 'confirm' ? '确认地址' : this.page === 'settings' ? 'API设置' : '独立 API')
           .fontSize(this.u(11)).fontColor(DIRECT_TEXT).textAlign(TextAlign.Center)
           .width(this.u(152)).height(this.u(30)).margin({ top: this.u(20) })
           .id('direct-crown-' + this.page).focusable(true).focusOnTouch(false).defaultFocus(true)
           .hitTestBehavior(HitTestMode.None)
           .onDigitalCrown((event: CrownEvent) => { this.handleCrown(event); })
       }
-    }.width('100%').height('100%').backgroundColor('#060A0D')
-      .linearGradient({ angle: 150, colors: [['#162D32', 0], ['#0B151C', 0.35], ['#060A0D', 0.8], ['#0B151B', 1]] })
+    }.width('100%').height('100%').backgroundColor('#080808')
+      .linearGradient({ angle: 150, colors: [['#191919', 0], ['#101010', 0.35], ['#080808', 0.8], ['#101010', 1]] })
       .clip(true)
       .onTouch((event: TouchEvent) => {
         if (event.type === TouchType.Down) { this.crownMotion.cancel(); }

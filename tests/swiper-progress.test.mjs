@@ -13,13 +13,13 @@ const close = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-1
 // 按官方语义模拟可见页回调；不假装这些是手表实测采样。
 function checkFrames(frames) {
   for (const progress of frames) {
-    for (let index = 0; index < 3; index++) {
+    for (let index = 0; index < 4; index++) {
       const position = index - progress;
-      if (Math.abs(position) <= 1) close(swiperProgress(index, position, 3), progress);
+      if (Math.abs(position) <= 1) close(swiperProgress(index, position, 4), progress);
     }
   }
 }
-for (const [from, to] of [[0, 1], [1, 0], [1, 2], [2, 1]]) {
+for (const [from, to] of [[0, 1], [1, 0], [1, 2], [2, 1], [2, 3], [3, 2]]) {
   test(`双向切页 ${from} → ${to}：拖动和惯性连续，多页回调一致`, () => {
     checkFrames([0, .025, .12, .36, .51, .72, .88, .96, .995, 1].map(t => from + (to - from) * t));
   });
@@ -37,9 +37,9 @@ test('原生弹簧越过中间目标再回弹', () => {
 test('非相邻程序切页也使用同一坐标系', () => {
   checkFrames([0, .2, .7, 1, 1.4, 1.8, 2]);
 });
-test('边界回弹不让白条跑出三点范围', () => {
-  assert.equal(swiperProgress(0, .2, 3), 0);
-  assert.equal(swiperProgress(2, -.2, 3), 2);
+test('边界回弹不让白条跑出四点范围', () => {
+  assert.equal(swiperProgress(0, .2, 4), 0);
+  assert.equal(swiperProgress(3, -.2, 4), 3);
 });
 test('末段小于 1vp 的移动保留小数，不量化为整数', () => {
   close(indicatorTranslation(.991, 10), 9.91);
@@ -50,7 +50,7 @@ test('页面接入仅由内容逐帧回调驱动，不叠加手势或选页补�
   const page = await readFile(new URL('../watch-app/entry/src/main/ets/pages/Index.ets', import.meta.url), 'utf8');
   const swiper = page.slice(page.indexOf('Swiper(this.swiper)'), page.indexOf('.layoutWeight(1)', page.indexOf('Swiper(this.swiper)')));
   assert.match(swiper, /onContentDidScroll/);
-  assert.match(swiper, /this\.slidePos = swiperProgress\(index, position, 3\)/);
+  assert.match(swiper, /this\.slidePos = swiperProgress\(index, position, PANEL_COUNT\)/);
   assert.doesNotMatch(swiper, /onGestureSwipe|animateTo/);
   const onChange = swiper.slice(swiper.indexOf('.onChange'));
   assert.doesNotMatch(onChange, /slidePos\s*=/);

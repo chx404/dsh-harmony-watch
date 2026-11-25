@@ -249,11 +249,14 @@ test('UI 接线安全：隐藏Key、后台/销毁停止、导入仅填草稿、�
   assert.match(localSource, /@StorageLink\('appInBackground'\) @Watch\('backgroundChanged'\)/);
   assert.match(localSource, /backgroundChanged\(\)[\s\S]*?this.stopProvision\(\);[\s\S]*?this.stopSend\(\);/);
   assert.match(localSource, /aboutToDisappear\(\)[\s\S]*?this.conversation.cancel\(\);[\s\S]*?this.stopProvision\(\);/);
-  assert.match(localSource, /directProvisionQrLink\(base, ticket.pagePath, ticket.id, ticket.expiresAt\)/);
+  assert.match(localSource, /new WatchProvisionService\(/);
+  assert.doesNotMatch(localSource, /hostBase|hostToken|startDirectProvision|pollDirectProvision|cancelDirectProvision/);
+  assert.match(localSource, /this\.pendingEndpoint = checked\.baseUrl/);
+  assert.match(localSource, /地址正确，继续/);
   assert.match(localSource, /this.fillDraft\(checked\);[\s\S]*?this.imported = true;[\s\S]*?尚未启用/);
   assert.match(localSource, /保存并新建/); assert.match(localSource, /this.conversation.reset\(\);/);
   assert.match(localSource, /Scroll\(this.settingsScroll\)/); assert.match(localSource, /\.onDigitalCrown/);
   assert.match(localSource, /requestFocus\('direct-crown-' \+ this.page\)/);
-  assert.match(localSource, /仅配置时需宿主；聊天由手表直连/); assert.match(localSource, /同一可信 WiFi/);
+  assert.match(localSource, /无需宿主或配对 · 手机直连手表/); assert.match(localSource, /同一可信 WiFi/);
   assert.doesNotMatch(source, /console\.|hilog\.|from ['"]\.\/Net/);
 });

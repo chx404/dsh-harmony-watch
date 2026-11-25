@@ -231,7 +231,7 @@ test('Index 按下/MOVE/UP/Cancel 接真实控制器，松手不受页面或 tou
 
 test('Index 只接受聊天页非零表冠 UPDATE，END 与 quiet timer 均恢复', () => {
   const allowed = method('canImmerseChat');
-  assert.match(allowed, /this\.view === 'main' && this\.pageIndex === 1/);
+  assert.match(allowed, /this\.view === 'main' && this\.pageIndex === CHAT_PANEL/);
   for (const guard of ['!this.showPrompt', '!this.showModels', '!this.showGuide', 'this.pageVisible']) {
     assert.ok(allowed.includes(guard), `missing guard ${guard}`);
   }

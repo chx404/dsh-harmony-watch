@@ -11,10 +11,10 @@ function extract(name) {
   assert.notEqual(start, -1, `missing ${name}`);
   return source.slice(start, source.indexOf('\n  }', start) + 4);
 }
-const names = ['pageChanged', 'handleCrown', 'u', 'loadConfig', 'loadProfiles', 'refreshProfiles', 'profileItems', 'profileAction', 'discardDraft', 'openProfile', 'editingChanged', 'fillDraft', 'draft', 'draftChanged', 'backRequested', 'returnTo', 'closePage', 'saveConfig', 'saveProfile', 'removeProfile', 'clearConfig', 'stopSend', 'newChat', 'send', 'backgroundChanged', 'beginProvision', 'pollProvision'];
+const names = ['pageChanged', 'handleCrown', 'u', 'loadConfig', 'loadProfiles', 'refreshProfiles', 'profileItems', 'profileAction', 'discardDraft', 'openProfile', 'editingChanged', 'fillDraft', 'draft', 'draftChanged', 'backRequested', 'returnTo', 'closePage', 'saveConfig', 'saveProfile', 'removeProfile', 'clearConfig', 'stopSend', 'newChat', 'send', 'backgroundChanged', 'stopProvision', 'clearPhoneImport', 'beginProvision', 'receivePhoneImport', 'confirmPhoneImport', 'rejectPhoneImport'];
 const js = ts.transpileModule(`class Harness {\n${names.map(extract).join('\n')}\n}`, { compilerOptions: { target: ts.ScriptTarget.ES2020 } }).outputText;
 function harness(overrides = {}) {
-  const calls = { upsert: [], select: [], remove: [], profileConfigured: [], profilesChanged: 0, save: [], clear: 0, configured: [], cleared: 0, closed: 0, reset: 0, cancel: 0, send: 0, stopProvision: 0, editing: [], animations: [] };
+  const calls = { upsert: [], select: [], remove: [], profileConfigured: [], profilesChanged: 0, save: [], clear: 0, configured: [], cleared: 0, closed: 0, reset: 0, cancel: 0, send: 0, stopProvision: 0, editing: [], animations: [], servers: [] };
   const copyConfig = c => ({ baseUrl: c.baseUrl, model: c.model, apiKey: c.apiKey, protocol: c.protocol });
   const validate = c => { if (!c.apiKey || !c.model || !c.baseUrl.startsWith('https://')) throw Error('invalid'); return copyConfig(c); };
   let records = [profile(), profile('two')], selectedId = 'one';
@@ -31,8 +31,13 @@ function harness(overrides = {}) {
     async select(id) { calls.select.push(id); selectedId = id; return { ...records.find(p => p.id === id) }; },
     async remove(id) { calls.remove.push(id); records = records.filter(p => p.id !== id); if (selectedId === id) selectedId = records[0]?.id || ''; }
   };
-  const Harness = new Function('copyDirectConfig', 'validateDirectConfig', 'pollDirectProvision', 'CrownAction', 'animateTo', 'Curve', 'normalizeDirectProvisionHost', 'startDirectProvision', 'directProvisionQrLink', 'cancelDirectProvision', 'setTimeout', 'clearTimeout', `${js}\nreturn Harness;`)(
-    copyConfig, validate, async () => ({ config: config('phone'), status: 'ready' }), { BEGIN: 0, UPDATE: 1, END: 2 },
+  class MockWatchProvisionService {
+    constructor(receive, notice) { this.receive = receive; this.notice = notice; this.stopped = false; calls.servers.push(this); }
+    async start() { if (overrides.startService) return overrides.startService(this); return { url: 'http://192.168.3.99:43210/#' + 'a'.repeat(43), expiresAt: Date.now() + 300000 }; }
+    stop() { this.stopped = true; }
+  }
+  const Harness = new Function('WatchProvisionService', 'copyDirectConfig', 'validateDirectConfig', 'pollDirectProvision', 'CrownAction', 'animateTo', 'Curve', 'normalizeDirectProvisionHost', 'startDirectProvision', 'directProvisionQrLink', 'cancelDirectProvision', 'setTimeout', 'clearTimeout', `${js}\nreturn Harness;`)(
+    MockWatchProvisionService, copyConfig, validate, async () => ({ config: config('phone'), status: 'ready' }), { BEGIN: 0, UPDATE: 1, END: 2 },
     (options, change) => { calls.animations.push(options); change(); }, { EaseOut: 'ease-out' }, b => b,
     async () => ({ id: 'ticket', pagePath: '/phone', expiresAt: Date.now() + 300000 }),
     () => 'https://host.example/phone?ticket=public', async () => {}, () => 1, () => {}
@@ -47,7 +52,7 @@ function harness(overrides = {}) {
     baseDraft: '', keyDraft: '', modelDraft: '', protocolDraft: 'chat', hostBase: 'https://host.example', hostToken: 'private-host-token', qrBusy: false,
     settingsScroll: { scrollTo() {} }, profileStore,
     conversation: { reset() { calls.reset++; }, cancel() { calls.cancel++; }, async send() { calls.send++; } },
-    stopProvision() { calls.stopProvision++; },
+    stopProvision() { calls.stopProvision++; Harness.prototype.stopProvision.call(this); },
     store: { async load() { return { config: config(), persistent: true, notice: 'legacy' }; }, async save(c) { calls.save.push(c); return { config: c, persistent: true, notice: 'legacy' }; }, async clear() { calls.clear++; } },
     onConfigured(c) { calls.configured.push(c); }, onConfigCleared() { calls.cleared++; },
     onProfileConfigured(p) { calls.profileConfigured.push(p); }, onProfilesChanged() { calls.profilesChanged++; },
@@ -131,7 +136,8 @@ test('扫码→编辑→列表→父历史返回；取消编辑不覆盖已保�
   v.backRequested(); assert.equal(v.page, 'profiles'); assert.equal(v.keyDraft, ''); assert.equal(c.closed, 0);
   assert.deepEqual(v.profiles.find(p => p.id === 'two'), profile('two'));
   v.backRequested(); assert.equal(c.closed, 1); assert.equal(c.animations.length, 2); assert.equal(c.upsert.length, 0); assert.equal(c.remove.length, 0);
-  assert.match(extract('stopProvision'), /cancelDirectProvision\(base, token, ticket.id\)/);
+  assert.match(extract('stopProvision'), /this\.watchProvision\?\.stop\(\)/);
+  assert.doesNotMatch(source, /hostBase|hostToken|startDirectProvision|pollDirectProvision|cancelDirectProvision/);
 });
 
 test('编辑输入和保存期间暂停返回；上报父editing并取消表冠弹性', () => {
@@ -144,6 +150,12 @@ test('编辑输入和保存期间暂停返回；上报父editing并取消表冠�
 
 test('编辑时手机扫码另建草稿，不覆盖profile；核对两次保存时才新增', async () => {
   const { value: v, calls: c } = harness(); v.openProfile('two'); await v.beginProvision();
+  assert.equal(v.page, 'qr'); assert.equal(v.imported, false);
+  c.servers[0].receive(config('phone'));
+  assert.equal(v.page, 'confirm'); assert.equal(v.pendingEndpoint, config('phone').baseUrl);
+  assert.equal(v.keyDraft, ''); assert.equal(c.upsert.length, 0);
+  v.confirmPhoneImport();
+  assert.equal(v.pendingImport, undefined);
   assert.equal(v.editingProfileId, ''); assert.equal(v.nameDraft, ''); assert.equal(v.imported, true); assert.equal(v.page, 'settings');
   assert.deepEqual(v.draft(), config('phone')); assert.equal(c.upsert.length, 0); assert.equal(c.profileConfigured.length, 0);
   assert.deepEqual(v.profiles, [profile(), profile('two')]); assert.match(v.status, /新草稿/); assert.match(v.status, /保存并返回主聊天/);
@@ -185,7 +197,7 @@ test('表冠BEGIN/UPDATE/END复用共享弹性，输入编辑禁用；切页后�
     assert.deepEqual(events, [['begin'], ['update', -22, 0, true, true], ['scroll', { xOffset: 0, yOffset: 0, animation: false }], ['end']]);
     v.inputEditing = true; v.handleCrown({ action: 1, degree: 10 }); assert.deepEqual(events.at(-1), ['cancel']);
   }
-  assert.equal((source.match(/\.translate\(\{ y: this\.crownStretch \}\)/g) || []).length, 2);
+  assert.equal((source.match(/\.translate\(\{ y: this\.crownStretch \}\)/g) || []).length, 4);
   for (const name of ['pageChanged', 'backgroundChanged', 'aboutToDisappear']) assert.match(extract(name), /this\.crownMotion\.cancel\(\)/);
   assert.match(source, /event.type === TouchType.Down\) \{ this.crownMotion.cancel\(\)/);
   assert.match(source, /@Prop @Watch\('backRequested'\) backRequest: number = 0/); assert.doesNotMatch(extract('backRequested'), /onClose|onRequestBack/);
@@ -198,4 +210,40 @@ test('生产send/newChat保护历史；默认旧模式依然可选但不会经�
   v.page = 'settings'; await v.saveConfig(); await v.saveConfig(); assert.equal(c.save.length, 1); assert.equal(c.upsert.length, 0);
   assert.equal(c.reset, 1); assert.equal(v.page, 'chat'); assert.equal(c.profileConfigured.length, 0);
   v.page = 'compose'; v.backRequested(); assert.equal(v.page, 'chat');
+});
+
+test('无需宿主凭据即可生成；收到后只显示完整地址，确认前不保存或调用API', async () => {
+  const { value: v, calls: c } = harness({ hostBase: '', hostToken: '' });
+  await v.beginProvision(); assert.equal(v.page, 'qr'); assert.match(v.qrValue, /^http:\/\/192\.168\.3\.99:/);
+  c.servers[0].receive(config('phone')); assert.equal(v.page, 'confirm'); assert.equal(v.pendingEndpoint, config('phone').baseUrl);
+  assert.equal(v.keyDraft, ''); assert.equal(c.upsert.length, 0); assert.equal(c.send, 0); assert.equal(c.profileConfigured.length, 0);
+  assert.match(source, /Text\(this.pendingEndpoint\)/); assert.doesNotMatch(source, /Text\(this.pendingImport/);
+});
+
+test('放弃和后台清除待确认Key，不改变已保存API', async () => {
+  const h = harness(); await h.value.beginProvision(); h.calls.servers[0].receive(config('phone'));
+  h.value.rejectPhoneImport(); assert.equal(h.value.pendingImport, undefined); assert.equal(h.value.pendingEndpoint, ''); assert.equal(h.value.keyDraft, ''); assert.equal(h.calls.upsert.length, 0);
+  await h.value.beginProvision(); h.calls.servers[1].receive(config('phone')); h.value.appInBackground = true; h.value.backgroundChanged();
+  assert.equal(h.value.page, 'settings'); assert.equal(h.value.pendingImport, undefined); h.value.confirmPhoneImport(); assert.equal(h.calls.upsert.length, 0); assert.deepEqual(h.value.profiles, [profile(), profile('two')]);
+});
+
+test('服务启动失败原因留在扫码页，可重试且不再访问宿主', async () => {
+  const h = harness({ startService: async () => { throw Error('请先让手表连接 Wi-Fi'); } }); await h.value.beginProvision();
+  assert.equal(h.value.page, 'qr'); assert.equal(h.value.qrBusy, false); assert.match(h.value.status, /Wi-Fi/); assert.equal(h.calls.servers[0].stopped, true);
+  assert.match(source, /this\.Pill\('重新生成'/); assert.doesNotMatch(source, /需更新并重启宿主|扫码需先与/);
+});
+
+test('取消后拒绝迟到的配置和启动结果，不会复活旧二维码或关闭新服务', async () => {
+  let finish; const h = harness({ startService: () => new Promise(resolve => { finish = resolve; }) });
+  const opening = h.value.beginProvision(); const stale = h.calls.servers[0]; h.value.stopProvision(); h.value.page = 'settings';
+  stale.receive(config('phone')); assert.equal(h.value.pendingImport, undefined);
+  finish({ url: 'http://192.168.3.99:43210/#old', expiresAt: Date.now() + 1000 }); await opening;
+  assert.equal(h.value.page, 'settings'); assert.equal(h.value.qrValue, ''); assert.equal(stale.stopped, true);
+});
+
+test('过期通知保留重试页；上一轮通知不能打断新扫码', async () => {
+  const h = harness(); await h.value.beginProvision(); const old = h.calls.servers[0]; old.notice('二维码已过期');
+  assert.equal(h.value.page, 'qr'); assert.equal(h.value.qrValue, ''); assert.match(h.value.status, /过期/);
+  await h.value.beginProvision(); const fresh = h.value.qrValue; old.notice('旧服务失效'); old.receive(config('phone'));
+  assert.equal(h.value.qrValue, fresh); assert.equal(h.value.page, 'qr'); assert.equal(h.value.pendingImport, undefined);
 });

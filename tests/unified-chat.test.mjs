@@ -39,8 +39,8 @@ function fixture() {
   const calls = { saved: [], toasts: [], sentLocal: 0, sentDsh: [], main: [], newDsh: 0, cancels: 0, pendingWrites: [] };
   let nextTimer = 0;
   const timers = new Map();
-  const Harness = new Function('visibleFeedEvents', 'sendPrompt', 'setTimeout', 'clearTimeout', js + '; return Harness;')(
-    events => events.filter(item => item.kind !== 'hidden'),
+  const Harness = new Function('CHAT_PANEL', 'visibleFeedEvents', 'sendPrompt', 'setTimeout', 'clearTimeout', js + '; return Harness;')(
+    2, events => events.filter(item => item.kind !== 'hidden'),
     async (base, token, text, mode) => { calls.sentDsh.push({ base, token, text, mode }); return { ok: true }; },
     callback => { const id = ++nextTimer; timers.set(id, callback); return id; },
     id => timers.delete(id)
@@ -78,7 +78,7 @@ function fixture() {
     localUnsaved: false, localId: 'local-a', localTitle: '本地标题', localModel: 'api-model',
     localNotice: '', localEvents: [], localSessions: [], sessions: [], pickerItems: [],
     currentSessionId: 'remote-a', localDraftTimer: -1, localUiEpoch: 0,
-    promptText: '', dshDraft: 'DSH草稿', token: 'paired', server: 'http://host',
+    promptText: '', dshDraft: 'DSH草稿', token: 'paired', server: 'http://host', connected: true, computerEpoch: 0,
     localController: controller, stopArmed: false,
     toast(text) { calls.toasts.push(text); }, scrollToBottom() {},
     resetChatChrome() {}, resetCrown() {}, requestDelay() {}, rememberChatKind() {}, closePrompt() { this.showPrompt = false; },
@@ -180,7 +180,7 @@ test('配置保存回调进入统一主聊天，保留DSH编辑缓冲和新会�
   const { h, calls } = fixture();
   h.chatKind = 'dsh'; h.promptText = '原DSH未发送内容';
   await h.configuredLocal({ baseUrl: 'https://api.test/v1', apiKey: 'test-only-key', model: 'new-model', protocol: 'chat' });
-  assert.equal(h.chatKind, 'local'); assert.equal(h.view, 'main'); assert.deepEqual(calls.main, [1]);
+  assert.equal(h.chatKind, 'local'); assert.equal(h.view, 'main'); assert.deepEqual(calls.main, [2]);
   assert.equal(h.promptText, '已存草稿'); assert.equal(h.dshDraft, '原DSH未发送内容'); assert.equal(h.localId, 'local-configured');
 });
 

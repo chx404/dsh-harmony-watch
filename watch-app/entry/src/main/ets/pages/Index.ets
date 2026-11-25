@@ -6,12 +6,16 @@ import backgroundTaskManager from '@ohos.resourceschedule.backgroundTaskManager'
 import wantAgent from '@ohos.app.ability.wantAgent';
 import { BusinessError } from '@ohos.base';
 import {
-  cancelTurn, decideApproval, fetchEventDetail, fetchModels, fetchSessions, fetchState, newSession, ping,
-  normalizeUrl, pair, selectSession, sendPrompt, switchModel
+  cancelTurn, decideApproval, fetchEventDetail, fetchModels, fetchSessions, fetchState, newSession,
+  pair, selectSession, sendPrompt, switchModel
 } from '../common/Net';
 import { DshEvent, DshImage, ModelOption, PendingInfo, ProviderOption, SessionInfo, SimpleResult, StateSnapshot } from '../common/Types';
 import { reconcileEventFeed, visibleFeedEvents } from '../common/EventFeed';
 import { swiperProgress, indicatorTranslation } from '../common/SwiperProgress';
+import { RepoWelcome } from '../common/RepoWelcome';
+import { APP_VERSION } from '../common/AppVersion';
+import { ComputerProfile, ComputerProfileSnapshot, normalizeComputerServer, parseComputerProfiles,
+  upsertComputerProfile, removeComputerProfile } from '../common/ComputerProfiles';
 import { QuickGuide } from '../common/QuickGuide';
 import { CrownMenu, CrownMenuItem } from '../common/CrownMenu';
 import { LocalChat } from '../common/LocalChat';
@@ -24,17 +28,22 @@ import { CrownElastic } from '../common/CrownElastic';
 import { ChatChromeController } from '../common/ChatImmersion';
 
 const STORE = 'dsh_watch';
-// Sea Glass：低饱和海盐绿，只给可操作元素和状态上色。
-const BG = '#060A0D';
-const CARD = '#142126';
-const TEXT = '#EDF4F3';
-const DIM = '#9BAFB3';
-const ACCENT = '#ADE9D9';
-const WARN = '#EFC49A';
-const OK = '#ADE9D9';
-const BAD = '#F1ABA8';
-const HAIRLINE = '#24D7F1EB';
-const INK = '#102D29';
+const COMPUTER_STORE = 'dsh_watch_computers';
+const COMPUTER_KEY = 'profilesV1';
+const PANEL_COUNT = 4;
+const SESSION_PANEL = 1;
+const CHAT_PANEL = 2;
+// 黑白设计：白色为主要操作，状态用文字、符号和明暗区分。
+const BG = '#080808';
+const CARD = '#191919';
+const TEXT = '#F4F4F4';
+const DIM = '#B5B5B5';
+const ACCENT = '#F5F5F5';
+const WARN = '#DFDFDF';
+const OK = '#F5F5F5';
+const BAD = '#DDDDDD';
+const HAIRLINE = '#24EBEBEB';
+const INK = '#111111';
 
 interface Preset {
   label: string;
@@ -92,6 +101,17 @@ struct Index {
   @State view: string = 'connect';
   @State bootReady: boolean = false;
   @State showGuide: boolean = false;
+  @State showRepoWelcome: boolean = false;
+  @State activeComputerId: string = '';
+  @State activeComputerName: string = '';
+  @State computerItems: CrownMenuItem[] = [];
+  @State computerNameEdit: string = '';
+  @State addressEdit: string = '';
+  private computerProfiles: ComputerProfile[] = [];
+  private computerStoreLoaded: boolean = false;
+  private computerEpoch: number = 0;
+  private computerDrafts: Map<string, string> = new Map<string, string>();
+  private removeArmedUntil: number = 0;
   @State chatKind: string = 'dsh';
   @State localSessions: LocalSession[] = [];
   @State localEvents: DshEvent[] = [];
@@ -124,8 +144,6 @@ struct Index {
   @State usingRemote: boolean = false;
   @State lanUrl: string = '';
   @State netMode: string = 'auto';
-  @State serverEdit: string = '';
-  @State settingsCode: string = '';
   @State lanEdit: string = '';
   @State remoteEdit: string = '';
   @State code: string = '';
@@ -160,8 +178,8 @@ struct Index {
   @State modelPending: boolean = false;
   @State modelsLoading: boolean = false;
   @State currentSessionId: string = '';
-  @State pageIndex: number = 1;
-  @State swiperInitialIndex: number = 1;
+  @State pageIndex: number = CHAT_PANEL;
+  @State swiperInitialIndex: number = CHAT_PANEL;
   @State localBackRequest: number = 0;
   @State editingInput: boolean = false;
   @State crownStretch: number = 0;
@@ -170,7 +188,7 @@ struct Index {
   private backPanStartX: number = 0;
   private crownOwner?: Scroller;
   private crownMotion: CrownElastic = new CrownElastic((stretch: number) => { this.crownStretch = stretch; });
-  @State slidePos: number = 1;
+  @State slidePos: number = CHAT_PANEL;
   @State notifyEnabled: string = '';
   @State bgState: string = '未启动';
   @State imgFail: number = 0;
@@ -198,15 +216,13 @@ struct Index {
   private promptScroller: Scroller = new Scroller();
   private connectScroller: Scroller = new Scroller();
   private approvalScroller: Scroller = new Scroller();
-  private sessionsScroller: Scroller = new Scroller();
   private modelsScroller: Scroller = new Scroller();
   private settingsScroller: Scroller = new Scroller();
   private swiper: SwiperController = new SwiperController();
   private diagScroller: Scroller = new Scroller();
   private menuItems: CrownMenuItem[] = [
-    { key: 'sessions', title: '会话', caption: '本地 API 与 DSH 会话', symbol: '≡' },
     { key: 'local', title: 'API 设置', caption: '模型、密钥与手机扫码', symbol: '◇' },
-    { key: 'settings', title: '连接设置', caption: '管理 DSH 宿主连接', symbol: '◇' },
+    { key: 'computers', title: '电脑', caption: '添加、切换与管理连接', symbol: '⊡' },
     { key: 'guide', title: '使用引导', caption: '重新认识腕上 DSH', symbol: '?' },
     { key: 'diagnostics', title: '诊断', caption: '连接、轮询与缓存', symbol: '◎' }
   ];
@@ -224,8 +240,8 @@ struct Index {
     { label: '停一下', text: '先停下来，说说现在的状态' }
   ];
   private actions: ActionItem[] = [
-    { key: 'allow', label: '允许', color: '#04120C', ring: '#6ED4A0' },
-    { key: 'deny', label: '拒绝', color: '#FFE9E9', ring: '#2A171C' }
+    { key: 'allow', label: '允许', color: '#0F0F0F', ring: '#BBBBBB' },
+    { key: 'deny', label: '拒绝', color: '#EEEEEE', ring: '#1B1B1B' }
   ];
 
   aboutToAppear(): void {
@@ -403,30 +419,13 @@ struct Index {
   private async restore(): Promise<void> {
     // 默认展示，偏好读取失败也能离线跳过；等待读取完成前不闪现配对页。
     this.showGuide = true;
+    this.showRepoWelcome = true;
     try {
       const p = await preferences.getPreferences(this.ctx(), STORE);
       this.showGuide = (await p.get('guideSeenV1', false)) !== true;
-      const s = await p.get('server', '');
-      const t = await p.get('token', '');
-      const sv: string = typeof s === 'string' ? s : '';
-      const tv: string = typeof t === 'string' ? t : '';
-      const nm = await p.get('netMode', 'auto');
-      if (typeof nm === 'string' && nm !== '') { this.netMode = nm; }
-      const lanSaved = await p.get('lan', '');
-      const remoteSaved = await p.get('remote', '');
-      if (typeof lanSaved === 'string' && lanSaved !== '') { this.lanEdit = lanSaved; this.lanUrl = lanSaved; }
-      if (typeof remoteSaved === 'string' && remoteSaved !== '') { this.remoteEdit = remoteSaved; this.remoteUrl = remoteSaved; }
-      if (tv === '' && this.serverEdit === '') {
-        this.serverEdit = this.server;
-      }
-      if (sv !== '' && tv !== '') {
-        this.server = sv;
-        this.primaryServer = sv;
-        this.token = tv;
-        this.connected = true;
-        this.switchView('main');
-        this.startPolling();
-      }
+      this.showRepoWelcome = (await p.get('repoWelcomeVersion', '')) !== APP_VERSION;
+      await this.restoreComputers(p);
+
     } catch (e) {
     } finally {
       if (this.localController) {
@@ -443,8 +442,19 @@ struct Index {
         } catch (e) { this.toast('本地会话读取失败，未覆盖原数据'); }
       }
       this.bootReady = true;
-      if (!this.showGuide) { this.ensureNotification(); }
+      if (!this.showGuide && !this.showRepoWelcome) { this.ensureNotification(); }
     }
+  }
+
+  private async finishRepoWelcome(remember: boolean): Promise<void> {
+    this.showRepoWelcome = false;
+    if (!this.showGuide) { this.ensureNotification(); }
+    if (!remember) { return; }
+    try {
+      const p = await preferences.getPreferences(this.ctx(), STORE);
+      await p.put('repoWelcomeVersion', APP_VERSION);
+      await p.flush();
+    } catch (_) { this.toast('未保存此版本的引导设置'); }
   }
 
   private async finishGuide(): Promise<void> {
@@ -484,7 +494,8 @@ struct Index {
   private updatePicker(): void {
     const items: CrownMenuItem[] = [
       { key: 'new-local', title: '新建独立会话', caption: '手表直连 API · 本地保存', symbol: '+' },
-      { key: 'new-dsh', title: '新建 DSH 会话', caption: '由已配对的宿主执行', symbol: '+' }
+      { key: 'new-dsh', title: '新建 DSH 会话', caption: this.activeComputerName || '先连接电脑', symbol: '+' },
+      { key: 'computer', title: this.activeComputerName || '连接电脑', caption: '点按管理和切换电脑', symbol: '⊡' }
     ];
     for (let i = 0; i < this.localSessions.length; i++) {
       const item = this.localSessions[i];
@@ -530,7 +541,7 @@ struct Index {
   }
 
   private async enterLocal(id: string = '', create: boolean = false): Promise<void> {
-    if (!this.localController || this.changingSession) { return; }
+    if (!this.localController || this.changingSession || this.connecting) { return; }
     this.changingSession = true;
     try {
       await this.flushLocalDraft();
@@ -543,7 +554,7 @@ struct Index {
       this.showPrompt = false; this.showModels = false;
       this.syncLocalView();
       this.promptText = this.localController.current()?.draft || '';
-      this.goPage(1); this.rememberChatKind();
+      this.goPage(CHAT_PANEL); this.rememberChatKind();
     } catch (error) {
       this.toast((error as Error).message || '本地会话不可用');
       if (!this.localController.hasConfig() && id === '') { this.switchView('local'); }
@@ -571,7 +582,7 @@ struct Index {
       await this.localController.useProfile(id);
       this.chatKind = 'local'; this.syncLocalView();
       this.promptText = this.localController.current()?.draft || '';
-      this.closeModels(); this.goPage(1); this.rememberChatKind();
+      this.closeModels(); this.goPage(CHAT_PANEL); this.rememberChatKind();
       this.toast('已选择 API，原会话保留');
     } catch (error) { this.toast((error as Error).message || '未能切换 API；原数据保留'); }
   }
@@ -585,7 +596,7 @@ struct Index {
       await this.localController.configured(config);
       this.chatKind = 'local'; this.syncLocalView();
       this.promptText = this.localController.current()?.draft || '';
-      this.goPage(1); this.rememberChatKind();
+      this.goPage(CHAT_PANEL); this.rememberChatKind();
     } catch (error) { this.toast((error as Error).message || '配置已保存，但未能打开会话'); }
   }
 
@@ -600,7 +611,7 @@ struct Index {
     const id: string = this.localId;
     const epoch: number = ++this.localUiEpoch;
     const text: string = this.promptText;
-    this.closePrompt(); this.goPage(1);
+    this.closePrompt(); this.goPage(CHAT_PANEL);
     try {
       await this.localController.send(text);
       if (epoch === this.localUiEpoch && this.chatKind === 'local' && this.localId === id) {
@@ -624,6 +635,7 @@ struct Index {
       return;
     }
     this.localDeleteArmed = false;
+    if (key === 'computer') { this.switchView('computers'); return; }
     if (key === 'new-dsh') {
       if (this.token === '') { this.toast('请先连接 DSH 宿主'); return; }
       await this.useDsh(); this.doNew(); return;
@@ -648,15 +660,16 @@ struct Index {
     for (let i = 0; i < text.length; i++) { hash = (hash * 31 + text.charCodeAt(i)) >>> 0; }
     return event.sessionId + ':' + event.seq + ':' + event.kind + ':' + text.length + ':' + hash;
   }
-  private chatTitle(): string { return this.chatKind === 'local' ? '✦ ' + this.localTitle : (this.title || 'DSH Watch'); }
+  private chatTitle(): string { return this.chatKind === 'local' ? '✦ ' + this.localTitle : (this.title || this.activeComputerName || 'DSH Watch'); }
   private modelCaption(): string {
     if (this.chatKind === 'local') { return '模型 · ' + (this.localModel || '选择 API'); }
     return '模型 · ' + (this.selectionModel || '跟随默认') + (this.modelPending ? ' · 下轮生效' : '');
   }
 
   private async saveHistory(sessionId: string, events: DshEvent[]): Promise<void> {
-    if (sessionId === '') { return; }
-    this.histories.set(sessionId, events);
+    if (sessionId === '' || this.activeComputerId === '') { return; }
+    const key: string = this.historyKey(sessionId);
+    this.histories.set(key, events);
     try {
       const slim: DshEvent[] = events.slice(-12).map((ev: DshEvent) => {
         const copy: DshEvent = {
@@ -666,22 +679,29 @@ struct Index {
         return copy;
       });
       const p = await preferences.getPreferences(this.ctx(), STORE);
-      await p.put('hist_' + sessionId, JSON.stringify(slim));
+      await p.put(key, JSON.stringify(slim));
       await p.flush();
     } catch (e) {
     }
   }
 
+  private historyKey(sessionId: string): string {
+    // The migrated computer alone can read pre-upgrade history keys.
+    return this.activeComputerId === 'legacy' ? 'hist_' + sessionId : 'pc_hist_' + this.activeComputerId + ':' + sessionId;
+  }
+
   private async loadHistory(sessionId: string): Promise<DshEvent[]> {
-    const cached: DshEvent[] | undefined = this.histories.get(sessionId);
+    if (this.activeComputerId === '') { return []; }
+    const key: string = this.historyKey(sessionId);
+    const cached: DshEvent[] | undefined = this.histories.get(key);
     if (cached !== undefined) { return cached; }
     try {
       const p = await preferences.getPreferences(this.ctx(), STORE);
-      const raw = await p.get('hist_' + sessionId, '');
+      const raw = await p.get(key, '');
       if (typeof raw === 'string' && raw !== '') {
         const list = JSON.parse(raw) as DshEvent[];
         if (Array.isArray(list)) {
-          this.histories.set(sessionId, list);
+          this.histories.set(key, list);
           return list;
         }
       }
@@ -690,22 +710,154 @@ struct Index {
     return [];
   }
 
-  private async persist(): Promise<void> {
+  private async restoreComputers(legacy: preferences.Preferences): Promise<void> {
     try {
-      const p = await preferences.getPreferences(this.ctx(), STORE);
-      await p.put('server', this.server);
-      await p.put('token', this.token);
-      await p.put('netMode', this.netMode);
-      await p.put('lan', this.lanUrl);
-      await p.put('remote', this.remoteUrl);
+      const p = await preferences.getPreferences(this.ctx(), COMPUTER_STORE);
+      const raw = await p.get(COMPUTER_KEY, '');
+      if (typeof raw !== 'string') { throw new Error('电脑列表格式有误'); }
+      let snapshot: ComputerProfileSnapshot = parseComputerProfiles(raw);
+      if (raw === '') {
+        const server = await legacy.get('server', '');
+        const token = await legacy.get('token', '');
+        if (typeof server === 'string' && server !== '' && typeof token === 'string' && token !== '') {
+          const mode = await legacy.get('netMode', 'auto');
+          const lan = await legacy.get('lan', '');
+          const remote = await legacy.get('remote', '');
+          snapshot = upsertComputerProfile(snapshot, { id: 'legacy', name: '原有电脑', server: server, token: token,
+            mode: mode === 'lan' || mode === 'remote' ? mode : 'auto',
+            lan: typeof lan === 'string' ? this.safeComputerAddress(lan) : '',
+            remote: typeof remote === 'string' ? this.safeComputerAddress(remote) : '' });
+          // Keep old keys intact for rollback. A present snapshot, even empty, suppresses reimport.
+          await this.writeComputers(snapshot);
+        }
+      }
+      this.computerProfiles = snapshot.profiles;
+      this.computerStoreLoaded = true;
+      const selected = this.findComputer(snapshot.selectedId);
+      if (selected) {
+        this.activateComputer(selected);
+        this.switchView('main');
+        this.startPolling();
+      } else { this.updateComputers(); }
+    } catch (_) { this.toast('电脑列表未能读取，未覆盖旧数据'); }
+  }
+
+  private safeComputerAddress(value: string): string {
+    try { return normalizeComputerServer(value); } catch (_) { return ''; }
+  }
+
+  private findComputer(id: string): ComputerProfile | undefined {
+    return this.computerProfiles.find((profile: ComputerProfile) => profile.id === id);
+  }
+
+  private async writeComputers(snapshot: ComputerProfileSnapshot): Promise<void> {
+    const p = await preferences.getPreferences(this.ctx(), COMPUTER_STORE);
+    try {
+      await p.put(COMPUTER_KEY, JSON.stringify(snapshot));
       await p.flush();
-    } catch (e) {
+    } catch (_) {
+      try { await preferences.removePreferencesFromCache(this.ctx(), COMPUTER_STORE); } catch (_) {}
+      throw new Error('电脑列表未保存');
     }
+  }
+
+  private updateComputers(): void {
+    const items: CrownMenuItem[] = [{ key: 'add', title: '添加电脑', caption: '输入地址及 6 位配对码', symbol: '+' }];
+    for (let i: number = 0; i < this.computerProfiles.length; i++) {
+      const profile: ComputerProfile = this.computerProfiles[i];
+      const active: boolean = this.activeComputerId === profile.id;
+      items.push({ key: 'pc:' + profile.id, title: profile.name, caption: active ? '当前控制 · 点按进入聊天' : '点按切换 · ' + profile.server,
+        symbol: active ? '✓' : '⊡' });
+    }
+    if (this.activeComputerId !== '') {
+      items.push({ key: 'settings', title: '当前电脑设置', caption: '名称、网络与移除', symbol: '◇' });
+    }
+    this.computerItems = items;
+  }
+
+  private activateComputer(profile?: ComputerProfile): void {
+    if (this.activeComputerId !== '') {
+      this.computerDrafts.set(this.activeComputerId, this.chatKind === 'dsh' ? this.promptText : this.dshDraft);
+    }
+    this.computerEpoch++;
+    this.requestGeneration++;
+    this.stopPolling();
+    this.busy = false;
+    this.feedSessionId = ''; this.events = []; this.lastSeq = -1;
+    this.sessions = []; this.sessionSource.set([]); this.sessionSig = ''; this.currentSessionId = '';
+    this.pending = []; this.lastPendingCount = 0; this.lastApprovalId = ''; this.lastRunning = false;
+    this.lastSaveAt = 0; this.title = ''; this.connected = false; this.status = 'offline';
+    this.lastError = ''; this.failCount = 0; this.imgFail = 0; this.testImgUrl = '';
+    this.expandedSeq = -1; this.expandedText = ''; this.localDeleteArmed = false;
+    this.showPrompt = false; this.showModels = false; this.modelsLoading = false; this.modelPending = false;
+    this.modelOptions = []; this.selectionModel = ''; this.selectionProvider = '';
+    this.stopArmed = false; this.removeArmedUntil = 0;
+    if (this.stopTimer >= 0) { clearTimeout(this.stopTimer); this.stopTimer = -1; }
+    this.activeComputerId = profile?.id || '';
+    this.activeComputerName = profile?.name || '';
+    this.computerNameEdit = this.activeComputerName;
+    this.primaryServer = profile?.server || '';
+    this.token = profile?.token || '';
+    this.lanUrl = profile?.lan || ''; this.remoteUrl = profile?.remote || '';
+    this.lanEdit = this.lanUrl; this.remoteEdit = this.remoteUrl;
+    this.netMode = profile?.mode || 'auto';
+    this.server = this.netMode === 'remote' && this.remoteUrl !== '' ? this.remoteUrl :
+      (this.netMode === 'lan' && this.lanUrl !== '' ? this.lanUrl : this.primaryServer);
+    this.usingRemote = this.server !== '' && this.server === this.remoteUrl;
+    this.dshDraft = this.computerDrafts.get(this.activeComputerId) || '';
+    if (this.chatKind === 'dsh') { this.promptText = this.dshDraft; }
+    this.updateComputers(); this.updatePicker();
+  }
+
+  private async prepareComputerControl(): Promise<void> {
+    if (this.localUnsaved) { throw new Error('请先保存本地回复'); }
+    await this.flushLocalDraft();
+  }
+
+  private enterComputerChat(): void {
+    if (this.chatKind !== 'local') { return; }
+    this.localUiEpoch++; this.localController?.cancel();
+    this.chatKind = 'dsh'; this.promptText = this.dshDraft;
+    this.stopArmed = false; this.showPrompt = false; this.showModels = false;
+    this.updatePicker(); this.rememberChatKind();
+  }
+
+  private async switchComputer(id: string): Promise<void> {
+    if (this.connecting || this.changingSession || !this.computerStoreLoaded) { return; }
+    const profile = this.findComputer(id);
+    if (!profile) { return; }
+    this.connecting = true;
+    try {
+      await this.prepareComputerControl();
+      if (id !== this.activeComputerId) {
+        await this.writeComputers({ profiles: this.computerProfiles, selectedId: id });
+        this.activateComputer(profile);
+      }
+      this.enterComputerChat();
+      this.switchView('main');
+      this.toast('当前电脑：' + profile.name);
+    } catch (_) { this.toast('未切换，请先保存本地回复或检查存储'); }
+    finally { this.connecting = false; this.startPolling(); }
+  }
+
+  private computerAction(key: string): void {
+    if (this.connecting || this.changingSession) { return; }
+    this.removeArmedUntil = 0;
+    if (key === 'add') {
+      this.addressEdit = ''; this.computerNameEdit = ''; this.code = '';
+      this.switchView('connect'); return;
+    }
+    if (key === 'settings') {
+      this.computerNameEdit = this.activeComputerName; this.lanEdit = this.lanUrl; this.remoteEdit = this.remoteUrl;
+      this.switchView('settings'); return;
+    }
+    if (key.startsWith('pc:')) { this.switchComputer(key.substring(3)); }
   }
 
   private startPolling(): void {
     this.stopPolling();
     this.pollDelay = 2000;
+    if (this.token === '' || this.server === '') { return; }
     this.poll();
     this.startLanProbe();
   }
@@ -747,14 +899,16 @@ struct Index {
         return;
       }
       const target: string = this.lanUrl;
-      ping(target).then((ok: boolean) => {
-        if (ok && this.usingRemote) {
+      const epoch: number = this.computerEpoch;
+      fetchState(target, this.token).then((snapshot: StateSnapshot) => {
+        if (snapshot.ok === true && epoch === this.computerEpoch && !this.connecting && this.usingRemote && target === this.lanUrl) {
+          this.requestGeneration++;
           this.server = target;
-          this.primaryServer = target;
           this.usingRemote = false;
+          this.connected = false;
           this.poll();
         }
-      });
+      }).catch(() => {});
     }, 30000);
   }
 
@@ -762,22 +916,23 @@ struct Index {
     if (this.token === '' || this.server === '') {
       return;
     }
-    if (this.busy || this.changingSession) {
+    if (this.busy || this.changingSession || this.connecting) {
       this.schedulePoll();
       return;
     }
     const generation: number = this.requestGeneration;
+    const epoch: number = this.computerEpoch;
     this.busy = true;
     try {
       const snap: StateSnapshot = await fetchState(this.server, this.token);
-      if (generation === this.requestGeneration && !this.changingSession) {
-        this.apply(snap);
-      }
+      if (generation !== this.requestGeneration || this.changingSession || this.connecting) { return; }
+      if (!snap || snap.ok !== true) { throw new Error('当前电脑未通过连接校验'); }
+      this.apply(snap);
       this.failCount = 0;
       this.pollDelay = 2000;
       this.lastError = '';
     } catch (e) {
-      if (generation === this.requestGeneration) {
+      if (generation === this.requestGeneration && !this.connecting) {
         this.connected = false;
         this.status = 'offline';
         this.lastError = this.errText(e);
@@ -786,75 +941,31 @@ struct Index {
         this.failover();
       }
     } finally {
-      this.busy = false;
-      this.schedulePoll();
+      if (epoch === this.computerEpoch) { this.busy = false; this.schedulePoll(); }
     }
   }
 
-  // 局域网不通就换外网地址，外网也断就退回原始地址，两个方向都只试一次。
-  private async pairFromSettings(): Promise<void> {
-    const base: string = this.netMode === 'remote' && this.remoteEdit !== ''
-      ? normalizeUrl(this.remoteEdit)
-      : (this.lanEdit !== '' ? normalizeUrl(this.lanEdit) : normalizeUrl(this.server));
-    if (base === '' || this.settingsCode.length < 6) {
-      this.toast('地址和 6 位码都要填');
-      return;
-    }
+  private async applyServer(mode: string = this.netMode): Promise<void> {
+    if (this.connecting || this.changingSession || !this.computerStoreLoaded) { return; }
+    const current = this.findComputer(this.activeComputerId);
+    if (!current) { return; }
+    this.connecting = true;
     try {
-      const r: SimpleResult = await pair(base, this.settingsCode);
-      if (r.ok === true) {
-        this.server = base;
-        this.primaryServer = base;
-        this.serverEdit = base;
-        this.token = r.token === undefined ? '' : r.token;
-        this.usingRemote = false;
-        this.settingsCode = '';
-        await this.persist();
-        this.switchView('main');
-        this.startPolling();
-        this.toast('已配对');
-      } else {
-        this.toast(r.error === undefined ? '配对失败' : r.error);
+      const lan: string = this.lanEdit.trim() === '' ? '' : normalizeComputerServer(this.lanEdit);
+      const remote: string = this.remoteEdit.trim() === '' ? '' : normalizeComputerServer(this.remoteEdit);
+      if ((mode === 'remote' && remote === '') || (mode === 'lan' && lan === '')) {
+        this.toast('请先填写对应地址'); return;
       }
-    } catch (e) {
-      this.toast('配对失败');
-    }
-  }
-
-  private applyServer(): void {
-    const lan: string = normalizeUrl(this.lanEdit);
-    const remote: string = normalizeUrl(this.remoteEdit);
-    if (lan === '' && remote === '') {
-      this.toast('至少填一个地址');
-      return;
-    }
-    this.lanUrl = lan;
-    this.remoteUrl = remote;
-    const base: string = this.netMode === 'remote' && remote !== '' ? remote : (lan !== '' ? lan : remote);
-    this.server = base;
-    this.primaryServer = base;
-    this.serverEdit = base;
-    this.usingRemote = base === remote && remote !== '';
-    this.persist();
-    this.poll();
-    this.toast('地址已更新');
-  }
-
-  private setNetMode(mode: string): void {
-    this.netMode = mode;
-    this.persist();
-    if (mode === 'remote' && this.remoteUrl !== '') {
-      this.server = this.remoteUrl;
-      this.usingRemote = true;
-    } else if (mode === 'lan' && this.lanUrl !== '') {
-      this.server = this.lanUrl;
-      this.primaryServer = this.lanUrl;
-      this.usingRemote = false;
-    } else if (mode === 'lan' && this.primaryServer !== '') {
-      this.server = this.primaryServer;
-      this.usingRemote = false;
-    }
-    this.poll();
+      const next = upsertComputerProfile({ profiles: this.computerProfiles, selectedId: current.id },
+        { id: current.id, server: current.server, token: current.token, name: this.computerNameEdit.trim() || current.name,
+          lan: lan, remote: remote, mode: mode });
+      await this.writeComputers(next);
+      this.computerProfiles = next.profiles;
+      const updated = this.findComputer(next.selectedId);
+      if (updated) { this.activateComputer(updated); }
+      this.toast('当前电脑设置已保存');
+    } catch (_) { this.toast('设置未保存，请检查地址及存储'); }
+    finally { this.connecting = false; this.startPolling(); }
   }
 
   private failover(): void {
@@ -886,10 +997,12 @@ struct Index {
       this.syncSessions(snap.sessions);
     }
     if (snap.remote !== undefined && snap.remote !== '') {
-      this.remoteUrl = snap.remote;
+      const candidate: string = this.safeComputerAddress(snap.remote);
+      if (candidate !== '') { this.remoteUrl = candidate; }
     }
     if (snap.lan !== undefined && snap.lan.length > 0) {
-      this.lanUrl = 'http://' + snap.lan[0];
+      const candidate: string = this.safeComputerAddress(snap.lan[0]);
+      if (candidate !== '') { this.lanUrl = candidate; }
     }
     if (snap.selection !== undefined) {
       this.selectionProvider = snap.selection.provider;
@@ -928,7 +1041,7 @@ struct Index {
     if (pend.length > 0 && (this.view === 'local' || this.chatKind === 'local') && this.lastPendingCount === 0) {
       this.toast('DSH 有待审批，返回后可处理');
     }
-    if (newApproval && this.view !== 'approval' && this.view !== 'prompt' && this.view !== 'local' && this.chatKind !== 'local') {
+    if (newApproval && this.view !== 'approval' && !this.connecting && this.view !== 'computers' && this.view !== 'settings' && this.view !== 'connect' && this.view !== 'prompt' && this.view !== 'local' && this.chatKind !== 'local') {
       this.switchView('approval');
     }
     if (pend.length === 0 && this.view === 'approval') {
@@ -986,27 +1099,22 @@ struct Index {
   }
 
   private async unbind(): Promise<void> {
-    this.requestGeneration += 1;
-    this.feedSessionId = '';
-    this.events = [];
-    this.lastSeq = -1;
-    this.sessions = [];
-    this.sessionSig = '';
-    this.currentSessionId = '';
-    this.sessionSource.set([]);
-    this.stopPolling();
-    this.token = '';
-    this.server = '';
-    this.connected = false;
-    try {
-      const p = await preferences.getPreferences(this.ctx(), STORE);
-      await p.delete('server');
-      await p.delete('token');
-      await p.flush();
-    } catch (e) {
+    if (this.connecting || this.changingSession || !this.computerStoreLoaded || this.activeComputerId === '') { return; }
+    if (Date.now() >= this.removeArmedUntil) {
+      this.removeArmedUntil = Date.now() + 3500; this.toast('再点一次，移除当前电脑'); return;
     }
-    this.switchView('connect');
-    this.toast('已解除绑定');
+    this.removeArmedUntil = 0;
+    this.connecting = true;
+    try {
+      const id: string = this.activeComputerId;
+      const next = removeComputerProfile({ profiles: this.computerProfiles, selectedId: id }, id);
+      await this.writeComputers(next);
+      this.computerProfiles = next.profiles;
+      this.activateComputer(); this.computerDrafts.delete(id);
+      this.backScene();
+      this.toast('已移除本表配对，不影响电脑');
+    } catch (_) { this.toast('未移除，请稍后重试'); }
+    finally { this.connecting = false; this.startPolling(); }
   }
 
   private async toggleDetail(ev: DshEvent): Promise<void> {
@@ -1019,8 +1127,9 @@ struct Index {
     this.expandedText = '';
     if (ev.hasDetail === true) {
       try {
+        const epoch: number = this.computerEpoch;
         const text: string = await fetchEventDetail(this.server, this.token, ev.sessionId, ev.seq, ev.t);
-        if (this.expandedSeq === ev.seq) { this.expandedText = text; }
+        if (epoch === this.computerEpoch && this.expandedSeq === ev.seq) { this.expandedText = text; }
       } catch (e) {
       }
     }
@@ -1031,6 +1140,7 @@ struct Index {
     if (this.showModels) {
       return;
     }
+    const epoch: number = this.computerEpoch;
     this.modelsLoading = true;
     animateTo({ duration: 260, curve: Curve.FastOutSlowIn }, () => {
       this.showModels = true;
@@ -1044,17 +1154,20 @@ struct Index {
         this.syncLocalView(); return;
       }
       const catalog = await fetchModels(this.server, this.token, this.feedSessionId);
-      if (catalog.ok === true) { this.modelOptions = catalog.providers; }
+      if (epoch === this.computerEpoch && catalog.ok === true) { this.modelOptions = catalog.providers; }
     } catch (e) {
-      this.toast('模型列表读取失败');
+      if (epoch === this.computerEpoch) { this.toast('模型列表读取失败'); }
     } finally {
-      this.modelsLoading = false;
+      if (epoch === this.computerEpoch) { this.modelsLoading = false; }
     }
   }
 
   private async doSwitchModel(provider: string, model: string): Promise<void> {
+    if (!this.connected || this.connecting) { return; }
+    const epoch: number = this.computerEpoch;
     try {
       const r: SimpleResult = await switchModel(this.server, this.token, this.feedSessionId, provider, model);
+      if (epoch !== this.computerEpoch || this.connecting) { return; }
       if (r.ok === true) {
         this.selectionProvider = provider;
         this.selectionModel = model;
@@ -1065,7 +1178,7 @@ struct Index {
         this.toast(r.error === undefined ? '切换失败' : r.error);
       }
     } catch (e) {
-      this.toast('切换失败');
+      if (epoch !== this.computerEpoch || this.connecting) { return; }      this.toast('切换失败');
     }
   }
 
@@ -1083,6 +1196,7 @@ struct Index {
 
   private openPrompt(): void {
     this.resetChatChrome();
+    if (this.chatKind === 'dsh' && !this.connected) { this.toast('当前电脑未在线'); return; }
     if (this.chatKind === 'local' && this.localUnsaved) { this.sendLocal(); return; }
     if (this.chatKind === 'local' && this.localBusy) { this.toast('请等待回复或先停止'); return; }
     animateTo({ duration: 260, curve: Curve.FastOutSlowIn }, () => {
@@ -1108,7 +1222,7 @@ struct Index {
 
   private switchView(v: string): void {
     if (v === 'menu') { this.goPage(0); return; }
-    if (v === 'main') { this.goPage(1); return; }
+    if (v === 'main') { this.goPage(CHAT_PANEL); return; }
     this.recordLocation({ view: v, page: this.pageIndex });
     // 再创建 Swiper 时保留其实际来源页，不重置到固定的中间页。
     this.swiperInitialIndex = this.pageIndex;
@@ -1118,19 +1232,27 @@ struct Index {
   }
 
   private goPage(index: number): void {
-    this.recordLocation({ view: 'main', page: index });
+    if (this.view === 'main') {
+      this.resetChatChrome(); this.resetCrown(); this.editingInput = false;
+    } else { this.recordLocation({ view: 'main', page: index }); }
     const recreate: boolean = this.view !== 'main';
     if (recreate) { this.swiperInitialIndex = index; this.slidePos = index; }
     this.pageIndex = index; this.view = 'main';
     if (!recreate) { try { this.swiper.changeIndex(index, true); } catch (e) { } }
-    if (index === 2) { this.refreshSessions(); }
+    if (index === SESSION_PANEL) { this.refreshSessions(); }
     this.focusLocation();
+  }
+
+  private panelFocus(index: number): string {
+    if (index === 0) { return 'crown-menu'; }
+    if (index === SESSION_PANEL) { return 'crown-sessions'; }
+    return index === CHAT_PANEL ? 'crown-main' : 'crown-quick';
   }
 
   private focusLocation(): void {
     setTimeout(() => {
       const id: string = this.view === 'main'
-        ? (this.pageIndex === 0 ? 'crown-menu' : (this.pageIndex === 2 ? 'crown-quick' : 'crown-main'))
+        ? this.panelFocus(this.pageIndex)
         : 'crown-' + this.view;
       try { this.getUIContext().getFocusController().requestFocus(id); } catch (e) { }
     }, 140);
@@ -1167,7 +1289,7 @@ struct Index {
   private backScene(): void {
     const target = this.viewHistory.pop();
     if (target) { this.restoreLocation(target); }
-    else { this.restoreLocation({ view: this.token !== '' || this.chatKind === 'local' ? 'main' : 'connect', page: 1 }); }
+    else { this.restoreLocation({ view: this.token !== '' || this.chatKind === 'local' ? 'main' : 'connect', page: CHAT_PANEL }); }
   }
 
   onBackPress(): boolean { return this.requestBack(); }
@@ -1188,15 +1310,18 @@ struct Index {
       this.closePrompt(); return true;
     }
     if (this.showModels) { this.closeModels(); return true; }
+    if (this.showRepoWelcome) { this.finishRepoWelcome(false); return true; }
     if (this.showGuide) { this.animateReturn(() => { this.finishGuide(); }); return true; }
     if (this.view === 'local') { this.localBackRequest++; return true; }
+    if (this.connecting) { return true; }
+    this.removeArmedUntil = 0;
     if (this.viewHistory.size() > 0) { this.backScene(); return true; }
     if (this.view !== 'main' && this.view !== 'connect') { this.backScene(); return true; }
     return false; // 只有真正根界面才允许系统退出 App。
   }
 
   private isBackSurface(): boolean {
-    return this.view !== 'main' || this.showPrompt || this.showModels || this.showGuide;
+    return this.view !== 'main' || this.showPrompt || this.showModels || this.showGuide || this.showRepoWelcome;
   }
 
   private resetCrown(): void {
@@ -1231,9 +1356,6 @@ struct Index {
     if (this.view === 'approval') {
       return this.approvalScroller;
     }
-    if (this.view === 'sessions') {
-      return this.sessionsScroller;
-    }
     return this.scroller;
   }
 
@@ -1247,8 +1369,8 @@ struct Index {
   }
 
   private canImmerseChat(): boolean {
-    return this.view === 'main' && this.pageIndex === 1 && !this.showPrompt && !this.showModels &&
-      !this.showGuide && this.pageVisible && !this.returnAnimating;
+    return this.view === 'main' && this.pageIndex === CHAT_PANEL && !this.showPrompt && !this.showModels &&
+      !this.showGuide && !this.showRepoWelcome && this.pageVisible && !this.returnAnimating;
   }
 
   private focusMainCrown(retry: boolean = true): void {
@@ -1332,42 +1454,39 @@ struct Index {
   }
 
   private async doConnect(): Promise<void> {
-    const base: string = normalizeUrl(this.server);
-    if (base === '') {
-      this.message = '先填地址';
-      return;
-    }
-    if (this.code.length < 6) {
-      this.message = '配对码 6 位';
-      return;
-    }
+    if (this.connecting || this.changingSession) { return; }
+    if (!this.computerStoreLoaded) { this.toast('电脑列表未载入，请重开应用'); return; }
+    let base: string;
+    try { base = normalizeComputerServer(this.addressEdit); }
+    catch (_) { this.toast('请输入有效的电脑地址'); return; }
+    const code: string = this.code.trim();
+    if (!/^[0-9]{6}$/.test(code)) { this.toast('请输入 6 位配对码'); return; }
+    const name: string = this.computerNameEdit.trim();
+    const id: string = 'pc-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 10);
     this.connecting = true;
-    this.message = '连接中…';
     try {
-      const r: SimpleResult = await pair(base, this.code);
-      if (r.ok !== true) {
-        this.message = r.error === undefined ? '配对失败' : r.error;
-        return;
-      }
-      this.server = base;
-      this.primaryServer = base;
-      if (r.addresses !== undefined && r.addresses.length > 0) {
-        this.lanUrl = 'http://' + r.addresses[0];
-      }
-      this.usingRemote = false;
-      this.token = r.token === undefined ? '' : r.token;
-      this.connected = true;
-      this.lastSeq = -1;
-      this.events = [];
+      await this.prepareComputerControl();
+      // Preflight limit/validation before a successful pairing rotates the computer's code.
+      const before: ComputerProfileSnapshot = { profiles: this.computerProfiles, selectedId: this.activeComputerId };
+      const sameAddress = this.computerProfiles.find((profile: ComputerProfile) => profile.server === base);
+      upsertComputerProfile(before, { id: id, name: name || base.substring(0, 120), server: base,
+        token: sameAddress?.token || 'pending' });
+      const result: SimpleResult = await pair(base, code);
+      if (result.ok !== true || !result.token) { this.toast(result.error || '配对失败'); return; }
+      const lan: string = result.addresses && result.addresses.length > 0 ? this.safeComputerAddress(result.addresses[0]) : '';
+      const label: string = (name || (typeof result.host === 'string' ? result.host.trim() : '') || base).substring(0, 120);
+      const next = upsertComputerProfile(before, { id: id, name: label, server: base, token: result.token,
+        lan: lan, remote: '', mode: 'auto' });
+      await this.writeComputers(next);
+      this.computerProfiles = next.profiles;
+      this.code = '';
+      const profile = this.findComputer(next.selectedId);
+      if (profile) { this.activateComputer(profile); }
+      this.enterComputerChat();
       this.switchView('main');
-      await this.persist();
-      this.startPolling();
-      this.toast('已连上');
-    } catch (e) {
-      this.message = '连不上：' + this.errText(e);
-    } finally {
-      this.connecting = false;
-    }
+      this.toast('已配对并保存 · ' + label);
+    } catch (_) { this.toast('未保存电脑；请检查存储或电脑数量（最多 12 台）'); }
+    finally { this.connecting = false; this.startPolling(); }
   }
 
   private async doSend(mode: string): Promise<void> {
@@ -1376,8 +1495,11 @@ struct Index {
     if (t === '' || this.token === '') {
       return;
     }
+    if (!this.connected || this.connecting) { return; }
+    const epoch: number = this.computerEpoch;
     try {
       const r: SimpleResult = await sendPrompt(this.server, this.token, t, mode);
+      if (epoch !== this.computerEpoch || this.connecting) { return; }
       if (r.ok === true) {
         this.promptText = '';
         this.closePrompt();
@@ -1387,7 +1509,7 @@ struct Index {
         this.toast(r.error === undefined ? '发送失败' : r.error);
       }
     } catch (e) {
-      this.toast('发送失败');
+      if (epoch !== this.computerEpoch || this.connecting) { return; }      this.toast('发送失败');
     }
   }
 
@@ -1399,16 +1521,19 @@ struct Index {
     if (this.token === '') {
       return;
     }
+    if (!this.connected || this.connecting) { return; }
+    const epoch: number = this.computerEpoch;
     try {
       const r: SimpleResult = await sendPrompt(this.server, this.token, text, 'followup');
+      if (epoch !== this.computerEpoch || this.connecting) { return; }
       if (r.ok === true) {
-        this.goPage(1);
+        this.goPage(CHAT_PANEL);
         this.toast('已发送');
       } else {
         this.toast(r.error === undefined ? '发送失败' : r.error);
       }
     } catch (e) {
-      this.toast('发送失败');
+      if (epoch !== this.computerEpoch || this.connecting) { return; }      this.toast('发送失败');
     }
   }
 
@@ -1417,8 +1542,11 @@ struct Index {
       return;
     }
     const id: string = this.pending[0].id;
+    if (!this.connected || this.connecting) { return; }
+    const epoch: number = this.computerEpoch;
     try {
       const r: SimpleResult = await decideApproval(this.server, this.token, id, decision);
+      if (epoch !== this.computerEpoch || this.connecting) { return; }
       if (r.ok === true) {
         this.pending = [];
         this.backScene();
@@ -1427,14 +1555,15 @@ struct Index {
         this.toast('提交失败');
       }
     } catch (e) {
-      this.toast('提交失败');
+      if (epoch !== this.computerEpoch || this.connecting) { return; }      this.toast('提交失败');
     }
   }
 
   private async doNew(): Promise<void> {
     if (this.chatKind === 'local') { await this.enterLocal('', true); return; }
     if (this.token === '') { this.toast('请先连接 DSH 宿主'); return; }
-    if (this.changingSession) { return; }
+    if (this.changingSession || this.connecting) { return; }
+    if (!this.connected) { this.toast('当前电脑未在线'); return; }
     this.changingSession = true;
     this.requestGeneration += 1;
     if (this.feedSessionId !== '') {
@@ -1460,21 +1589,14 @@ struct Index {
     }
   }
 
-  private openSessions(): void {
-    this.localDeleteArmed = false;
-    this.updatePicker();
-    this.flushLocalDraft().catch(() => { this.toast('当前草稿未保存，请重试'); });
-    this.switchView('sessions');
-    this.refreshSessions();
-  }
-
   private async refreshSessions(): Promise<void> {
-    if (this.token === '') {
+    if (this.token === '' || this.connecting) {
       return;
     }
     try {
+      const epoch: number = this.computerEpoch;
       const r = await fetchSessions(this.server, this.token);
-      if (r.sessions) {
+      if (epoch === this.computerEpoch && r.sessions) {
         this.syncSessions(r.sessions);
       }
     } catch (e) {
@@ -1499,7 +1621,8 @@ struct Index {
   private async doSelect(id: string): Promise<void> {
     if (this.token === '') { this.toast('请先连接 DSH 宿主'); return; }
     if (this.localUnsaved) { this.toast('请先保存已收到的本地回复'); return; }
-    if (this.changingSession) { return; }
+    if (this.changingSession || this.connecting) { return; }
+    if (!this.connected) { this.toast('当前电脑未在线'); return; }
     this.changingSession = true;
     this.requestGeneration += 1;
     try {
@@ -1548,11 +1671,13 @@ struct Index {
       this.localUiEpoch++; this.localController?.cancel();
       this.toast('已停止，输入已留在本地草稿'); return;
     }
+    if (!this.connected || this.connecting) { return; }
+    const epoch: number = this.computerEpoch;
     try {
       await cancelTurn(this.server, this.token);
-      this.toast('已请求停止');
+      if (epoch === this.computerEpoch) { this.toast('已请求停止'); }
     } catch (e) {
-      this.toast('请求失败');
+      if (epoch === this.computerEpoch) { this.toast('请求失败'); }
     }
   }
 
@@ -1625,16 +1750,16 @@ struct Index {
   private eventColor(ev: DshEvent): string {
     const kind: string = ev.kind;
     if (kind === 'user') {
-      return '#7FB6FF';
+      return '#B0B0B0';
     }
     if (kind === 'assistant') {
       return TEXT;
     }
     if (kind === 'tool') {
-      return '#FFC66D';
+      return '#CCCCCC';
     }
     if (kind === 'tool-result') {
-      return '#9ED49A';
+      return '#C4C4C4';
     }
     if (kind === 'approval') {
       return WARN;
@@ -1642,18 +1767,18 @@ struct Index {
     if (kind === 'turn' || kind === 'status') {
       return DIM;
     }
-    return '#9AA6B5';
+    return '#A5A5A5';
   }
 
   // 以下仅为视觉与布局，网络、配对、消息处理沿用原实现。
   private eventSurface(ev: DshEvent): string {
     if (ev.kind === 'user') {
-      return '#152B2A';
+      return '#262626';
     }
     if (ev.kind === 'assistant') {
-      return '#142026';
+      return '#1E1E1E';
     }
-    return '#0D151B';
+    return '#141414';
   }
 
   private pagePos(): number {
@@ -1665,36 +1790,16 @@ struct Index {
   PageDots() {
     Stack() {
       Row() {
-        Text('')
-          .width(this.px(4))
-          .height(this.px(4))
-          .backgroundColor('#5E6E74')
-          .borderRadius(this.px(2))
-          .margin({ left: this.px(3), right: this.px(3) })
-        Text('')
-          .width(this.px(4))
-          .height(this.px(4))
-          .backgroundColor('#5E6E74')
-          .borderRadius(this.px(2))
-          .margin({ left: this.px(3), right: this.px(3) })
-        Text('')
-          .width(this.px(4))
-          .height(this.px(4))
-          .backgroundColor('#5E6E74')
-          .borderRadius(this.px(2))
-          .margin({ left: this.px(3), right: this.px(3) })
-      }
-      .height(this.px(4))
-      Text('')
-        .width(this.px(10))
-        .height(this.px(4))
-        .backgroundColor('#FFFFFF')
-        .borderRadius(this.px(2))
-        .position({ x: this.px(2), y: 0 })
+        ForEach([0, 1, 2, 3], (dot: number) => {
+          Text('').width(this.px(4)).height(this.px(4))
+            .backgroundColor('#626262').borderRadius(this.px(2))
+            .margin({ left: this.px(3), right: this.px(3) })
+        }, (dot: number) => dot.toString())
+      }.height(this.px(4))
+      Text('').width(this.px(10)).height(this.px(4)).backgroundColor('#FFFFFF')
+        .borderRadius(this.px(2)).position({ x: this.px(2), y: 0 })
         .translate({ x: indicatorTranslation(this.slidePos, this.px(10)), y: 0 })
-    }
-    .width(this.px(34))
-    .height(this.px(4))
+    }.width(this.px(44)).height(this.px(4))
   }
 
   build() {
@@ -1709,12 +1814,15 @@ struct Index {
         .width('100%')
         .height('100%')
         .justifyContent(FlexAlign.Center)
+      } else if (this.showRepoWelcome) {
+        RepoWelcome({ screenWidth: this.sw, screenHeight: this.sh,
+          onDismiss: () => { this.finishRepoWelcome(true); }, onSkip: () => { this.finishRepoWelcome(false); } })
       } else if (this.showGuide) {
         QuickGuide({ screenWidth: this.sw, screenHeight: this.sh,
           onFinish: () => { this.finishGuide(); } })
       } else if (this.view === 'local') {
         LocalChat({ screenWidth: this.sw, screenHeight: this.sh,
-          hostBase: this.server, hostToken: this.token, settingsOnly: true,
+          settingsOnly: true,
           onConfigured: (config: DirectApiConfig) => { this.configuredLocal(config); },
           onProfileConfigured: (profile: ApiProfile) => { this.chooseApiProfile(profile.id); },
           onProfilesChanged: () => { this.reloadApiProfiles(); },
@@ -1727,8 +1835,8 @@ struct Index {
         this.ConnectView()
       } else if (this.view === 'approval') {
         this.ApprovalView()
-      } else if (this.view === 'sessions') {
-        this.SessionsView()
+      } else if (this.view === 'computers') {
+        this.ComputersView()
       } else if (this.view === 'settings') {
         this.SettingsView()
       } else if (this.view === 'diagnostics') {
@@ -1737,6 +1845,7 @@ struct Index {
         Column() {
           Swiper(this.swiper) {
             this.MenuView()
+            this.SessionsView()
             this.MainView()
             this.QuickView()
           }
@@ -1747,7 +1856,7 @@ struct Index {
           .onContentDidScroll((_selectedIndex: number, index: number, position: number, _mainAxisLength: number) => {
             // 原生逐帧位置覆盖拖动、松手惯性、取消回弹和程序切页。
             // 不依赖 selectedIndex，避免选中页变化或同帧多页回调造成反向/跳变。
-            this.slidePos = swiperProgress(index, position, 3);
+            this.slidePos = swiperProgress(index, position, PANEL_COUNT);
           })
           .onAppear(() => {
             // 返回子页面来源时按历史重建，不把菜单/快捷强制重置成聊天页。
@@ -1756,17 +1865,19 @@ struct Index {
           })
           .onAnimationEnd((i: number, _extra: SwiperAnimationEvent) => {
             // 缓存页出现时不能抢焦点；翻页完成后把表冠明确交给当前页。
-            if (this.view !== 'main' || this.showGuide) { return; }
-            const focus: string = i === 0 ? 'crown-menu' : (i === 2 ? 'crown-quick' : 'crown-main');
+            if (this.view !== 'main' || this.showGuide || this.showRepoWelcome) { return; }
+            const focus: string = this.panelFocus(i);
             try { this.getUIContext().getFocusController().requestFocus(focus); } catch (e) { }
           })
           .onChange((i: number) => {
             this.resetChatChrome();
             this.pageIndex = i;
             // 选中项事件不驱动白条，不能提前抢走尚未结束的原生动画。
-            const focus: string = i === 0 ? 'crown-menu' : (i === 2 ? 'crown-quick' : 'crown-main');
+            const focus: string = this.panelFocus(i);
             try { this.getUIContext().getFocusController().requestFocus(focus); } catch (e) { }
-            if (i === 2) {
+            if (i === SESSION_PANEL) {
+              this.localDeleteArmed = false;
+              this.updatePicker();
               this.refreshSessions();
             }
           })
@@ -1784,7 +1895,7 @@ struct Index {
         .width('100%')
         .height('100%')
       }
-      if (this.message !== '' && this.bootReady && !this.showGuide) {
+      if (this.message !== '' && this.bootReady && !this.showGuide && !this.showRepoWelcome) {
         Text(this.message)
           .fontSize(this.vp(9))
           .fontWeight(FontWeight.Medium)
@@ -1802,7 +1913,7 @@ struct Index {
     .width('100%')
     .height('100%')
     .backgroundColor(BG)
-    .linearGradient({ angle: 150, colors: [['#162D32', 0], ['#0B151C', 0.32], [BG, 0.76], ['#0B151B', 1]] })
+    .linearGradient({ angle: 150, colors: [['#191919', 0], ['#101010', 0.32], [BG, 0.76], ['#101010', 1]] })
     .translate({ x: this.sceneX })
     .opacity(this.sceneOpacity)
     .onTouch((event: TouchEvent) => {
@@ -1841,7 +1952,7 @@ struct Index {
           .fontSize(this.vp(9))
           .fontColor(DIM)
           .margin({ top: this.px(3), bottom: this.px(14) })
-        TextInput({ placeholder: '服务器地址', text: this.server })
+        TextInput({ placeholder: '电脑地址', text: this.addressEdit })
           .fontSize(this.vp(10))
           .placeholderFont({ size: this.vp(9) })
           .fontColor(TEXT)
@@ -1851,7 +1962,13 @@ struct Index {
           .border({ width: 0.5, color: HAIRLINE })
           .borderRadius(this.px(12))
           .onEditChange((editing: boolean) => { this.editingInput = editing; })
-          .onChange((v: string) => { this.server = v; })
+          .onChange((v: string) => { this.addressEdit = v; })
+        TextInput({ placeholder: '名称（可选）', text: this.computerNameEdit })
+          .fontSize(this.vp(10)).fontColor(TEXT).placeholderColor(DIM)
+          .height(this.px(32)).width('100%').margin({ top: this.px(7) }).backgroundColor(CARD)
+          .border({ width: 0.5, color: HAIRLINE }).borderRadius(this.px(12)).maxLength(40)
+          .onEditChange((editing: boolean) => { this.editingInput = editing; })
+          .onChange((v: string) => { this.computerNameEdit = v; })
         TextInput({ placeholder: '六位配对码', text: this.code })
           .type(InputType.Number)
           .fontSize(this.vp(12))
@@ -1865,37 +1982,35 @@ struct Index {
           .margin({ top: this.px(7) })
           .onEditChange((editing: boolean) => { this.editingInput = editing; })
           .onChange((v: string) => { this.code = v; })
+        Button(this.connecting ? '配对中…' : '配对并保存', { type: ButtonType.Capsule })
+          .fontSize(this.vp(10)).fontColor(INK).backgroundColor(ACCENT)
+          .height(this.px(36)).width('100%').margin({ top: this.px(10) })
+          .enabled(!this.connecting).onClick(() => { this.doConnect(); })
+        if (this.computerItems.length > 1 && this.activeComputerId === '') {
+          Button('已保存的电脑', { type: ButtonType.Capsule })
+            .fontSize(this.vp(10)).fontColor(TEXT).backgroundColor(CARD)
+            .height(this.px(36)).width('100%').margin({ top: this.px(8) })
+            .enabled(!this.connecting).onClick(() => { this.switchView('computers'); })
+        }
         Text('独立 API 对话')
           .fontSize(this.vp(10))
           .fontColor(ACCENT)
           .textAlign(TextAlign.Center)
           .height(this.px(34))
           .width('100%')
-          .backgroundColor('#142126')
+          .backgroundColor('#191919')
           .borderRadius(this.px(17))
           .margin({ top: this.px(10) })
           .clickEffect({ level: ClickEffectLevel.LIGHT })
-          .onClick(() => { this.enterLocal(); })
+          .onClick(() => { if (!this.connecting) { this.enterLocal(); } })
         Text('先进入工作台')
           .fontSize(this.vp(8))
           .fontColor(DIM)
           .margin({ top: this.px(10) })
           .padding({ top: this.px(4), bottom: this.px(4), left: this.px(10), right: this.px(10) })
           .clickEffect({ level: ClickEffectLevel.LIGHT })
-          .onClick(() => { this.switchView('main'); })
-        Text(this.connecting ? '连接中…' : '连接设备  ↗')
-          .fontSize(this.vp(10))
-          .fontWeight(FontWeight.Medium)
-          .fontColor(INK)
-          .textAlign(TextAlign.Center)
-          .height(this.px(30))
-          .width('100%')
-          .backgroundColor(ACCENT)
-          .borderRadius(this.px(15))
-          .margin({ top: this.px(10) })
-          .enabled(!this.connecting)
-          .clickEffect({ level: ClickEffectLevel.LIGHT })
-          .onClick(() => { this.doConnect(); })
+          .onClick(() => { if (!this.connecting) { this.switchView('main'); } })
+
       }
       .width('100%')
       .padding({ left: this.px(43), right: this.px(43), top: this.px(34), bottom: this.px(38) })
@@ -1914,7 +2029,7 @@ struct Index {
         Text(ev.kind === 'user' ? (ev.text === undefined ? '' : ev.text) : this.formatEvent(ev))
           .fontSize(this.vp(11))
           .lineHeight(this.vp(16))
-          .fontColor(ev.kind === 'user' ? '#0C1B10' : TEXT)
+          .fontColor(ev.kind === 'user' ? '#111111' : TEXT)
           .textAlign(TextAlign.Start)
       }
       if (ev.images !== undefined && ev.images.length > 0) {
@@ -1928,14 +2043,14 @@ struct Index {
         if (ev.images.length > 1) {
           Text('+' + (ev.images.length - 1) + ' 张')
             .fontSize(this.vp(7))
-            .fontColor(ev.kind === 'user' ? '#33501F' : DIM)
+            .fontColor(ev.kind === 'user' ? '#414141' : DIM)
             .margin({ top: this.px(2) })
         }
       }
     }
     .alignItems(ev.kind === 'user' ? HorizontalAlign.End : HorizontalAlign.Start)
     .padding({ left: this.px(12), right: this.px(12), top: this.px(8), bottom: this.px(8) })
-    .backgroundColor(ev.kind === 'user' ? '#95EC69' : '#18242A')
+    .backgroundColor(ev.kind === 'user' ? '#EEEEEE' : '#1D1D1D')
     .borderRadius(this.px(16))
     .constraintSize({ maxWidth: this.px(172) })
   }
@@ -2008,7 +2123,7 @@ struct Index {
                   .width('100%')
                   .padding({ left: this.px(10), right: this.px(10), top: this.px(6), bottom: this.px(6) })
                   .margin({ left: this.px(6), right: this.px(6) })
-                  .backgroundColor('#0B1418')
+                  .backgroundColor('#121212')
                   .borderRadius(this.px(12))
                   .opacity(1)
                 }
@@ -2045,13 +2160,20 @@ struct Index {
         Column() {
         Column() {
         Row() {
-          Text(this.chatTitle())
-            .fontSize(this.vp(10))
-            .fontWeight(FontWeight.Medium)
-            .fontColor(TEXT)
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .layoutWeight(1)
+          Column({ space: this.px(1) }) {
+            Text(this.chatTitle())
+              .fontSize(this.vp(10))
+              .fontWeight(FontWeight.Medium)
+              .fontColor(TEXT)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .width('100%')
+            if (this.chatKind === 'dsh') {
+              Text(this.activeComputerName ? this.activeComputerName + ' ›' : '选择电脑 ›')
+                .fontSize(this.vp(7)).fontColor(DIM).maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
+            }
+          }.alignItems(HorizontalAlign.Start).layoutWeight(1)
           Circle({ width: this.vp(5), height: this.vp(5) })
             .fill(this.chatKind === 'local' ? (this.localBusy ? WARN : ACCENT) : (this.connected ? (this.status === 'running' ? WARN : OK) : DIM))
             .margin({ left: this.px(7) })
@@ -2059,6 +2181,8 @@ struct Index {
         .width('100%')
         .height(this.px(26))
         .padding({ left: this.px(57), right: this.px(57) })
+        .accessibilityText(this.chatKind === 'dsh' ? this.chatTitle() + '，管理和切换电脑' : this.chatTitle())
+        .onClick(() => { if (this.chatKind === 'dsh') { this.switchView('computers'); } })
         }
         .id('chat-header')
         .width('100%')
@@ -2080,8 +2204,8 @@ struct Index {
             .textAlign(TextAlign.Center)
             .height(this.px(22))
             .width('100%')
-            .backgroundColor('#30251E')
-            .border({ width: 0.5, color: '#40EFC49A' })
+            .backgroundColor('#272727')
+            .border({ width: 0.5, color: '#40DFDFDF' })
             .borderRadius(this.px(11))
             .margin({ top: this.px(4) })
             .clickEffect({ level: ClickEffectLevel.LIGHT })
@@ -2104,20 +2228,20 @@ struct Index {
           .height(this.px(28))
           .layoutWeight(1)
           .padding({ left: this.px(11), right: this.px(9) })
-          .backgroundColor('#0D181C')
-          .border({ width: 0.5, color: '#2A4046' })
+          .backgroundColor('#181818')
+          .border({ width: 0.5, color: '#3C3C3C' })
           .borderRadius(this.px(14))
           .accessibilityText('编辑指令')
           .clickEffect({ level: ClickEffectLevel.LIGHT })
           .onClick(() => { this.openPrompt(); })
           Text(this.stopArmed ? '确认' : '■')
             .fontSize(this.stopArmed ? this.vp(7) : this.vp(8))
-            .fontColor(this.stopArmed ? '#FFFFFF' : BAD)
+            .fontColor(this.stopArmed ? INK : BAD)
             .textAlign(TextAlign.Center)
             .width(this.stopArmed ? this.px(34) : this.px(28))
             .height(this.px(28))
-            .backgroundColor(this.stopArmed ? '#7A2A2E' : '#282126')
-            .border({ width: 0.5, color: this.stopArmed ? '#B4585C' : '#46F1ABA8' })
+            .backgroundColor(this.stopArmed ? '#E5E5E5' : '#232323')
+            .border({ width: 0.5, color: this.stopArmed ? '#FAFAFA' : '#46DDDDDD' })
             .borderRadius(this.px(14))
             .margin({ left: this.px(6) })
             .accessibilityText(this.stopArmed ? '确认停止当前任务' : '停止当前任务')
@@ -2134,9 +2258,10 @@ struct Index {
             .fontColor(this.modelPending ? WARN : (this.selectionModel === '' ? DIM : ACCENT))
             .height(this.px(16))
             .padding({ left: this.px(11), right: this.px(11) })
-            .textAlign(TextAlign.Center)
-            .backgroundColor('#14D5EFE9')
-            .border({ width: 0.5, color: '#2AD7F1EB' })
+            .textAlign(TextAlign.Center).maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis }).constraintSize({ maxWidth: this.px(140) })
+            .backgroundColor('#14E9E9E9')
+            .border({ width: 0.5, color: '#2AEBEBEB' })
             .borderRadius(this.px(8))
             .clickEffect({ level: ClickEffectLevel.LIGHT })
             .onClick(() => { this.openModels(); })
@@ -2163,7 +2288,7 @@ struct Index {
           Column() {}
             .width('100%')
             .height('100%')
-            .backgroundColor('#9903070A')
+            .backgroundColor('#99060606')
             .onClick(() => { this.closePrompt(); })
           Column() {
             Row() {
@@ -2189,8 +2314,8 @@ struct Index {
               .fontSize(this.vp(10))
               .fontColor(TEXT)
               .placeholderColor(DIM)
-              .backgroundColor('#0B171D')
-              .border({ width: 0.5, color: '#35B8E0D6' })
+              .backgroundColor('#151515')
+              .border({ width: 0.5, color: '#35D7D7D7' })
               .borderRadius(this.px(12))
               .height(this.px(44))
               .width('100%')
@@ -2206,7 +2331,7 @@ struct Index {
                 .textAlign(TextAlign.Center)
                 .height(this.px(28))
                 .layoutWeight(1)
-                .backgroundColor('#23343A')
+                .backgroundColor('#313131')
                 .border({ width: 0.5, color: HAIRLINE })
                 .borderRadius(this.px(14))
                 .clickEffect({ level: ClickEffectLevel.LIGHT })
@@ -2230,10 +2355,10 @@ struct Index {
           }
           .width(this.px(174))
           .padding({ left: this.px(14), right: this.px(14), top: this.px(10), bottom: this.px(12) })
-          .linearGradient({ angle: 145, colors: [['#F32A4144', 0], ['#F2112029', 1]] })
+          .linearGradient({ angle: 145, colors: [['#F33C3C3C', 0], ['#F21D1D1D', 1]] })
           .backgroundBlurStyle(BlurStyle.Thin, { colorMode: ThemeColorMode.DARK })
           .borderRadius(this.px(22))
-          .border({ width: 0.5, color: '#66C2E5DA' })
+          .border({ width: 0.5, color: '#66DDDDDD' })
           .shadow({ radius: this.px(18), color: '#66000000', offsetY: this.px(7) })
           .transition(TransitionEffect.scale({ x: 0.94, y: 0.94 }).combine(TransitionEffect.OPACITY))
         }
@@ -2247,7 +2372,7 @@ struct Index {
           Column() {}
             .width('100%')
             .height('100%')
-            .backgroundColor('#9903070A')
+            .backgroundColor('#99060606')
             .onClick(() => { this.closeModels(); })
           Column() {
             Row() {
@@ -2330,7 +2455,7 @@ struct Index {
             if (this.chatKind === 'local') {
               Text(this.apiProfiles.length === 0 ? '添加 API 配置' : '管理 API 配置')
                 .fontSize(this.vp(10)).fontColor(ACCENT).textAlign(TextAlign.Center)
-                .height(this.px(28)).width('100%').backgroundColor('#142126').borderRadius(this.px(14))
+                .height(this.px(28)).width('100%').backgroundColor('#191919').borderRadius(this.px(14))
                 .margin({ top: this.px(3) })
                 .onClick(() => { this.closeModels(); this.openLocalSettings(); })
             }
@@ -2338,9 +2463,9 @@ struct Index {
           .width(this.px(176))
           .height(this.px(150))
           .padding({ left: this.px(14), right: this.px(14), top: this.px(10), bottom: this.px(10) })
-          .linearGradient({ angle: 145, colors: [['#F32A4144', 0], ['#F2112029', 1]] })
+          .linearGradient({ angle: 145, colors: [['#F33C3C3C', 0], ['#F21D1D1D', 1]] })
           .borderRadius(this.px(20))
-          .border({ width: 0.5, color: '#66C2E5DA' })
+          .border({ width: 0.5, color: '#66DDDDDD' })
           .transition(TransitionEffect.scale({ x: 0.88, y: 0.88 }).combine(TransitionEffect.OPACITY))
         }
         .width('100%')
@@ -2400,8 +2525,8 @@ struct Index {
             .textAlign(TextAlign.Center)
             .width('100%')
             .height(this.px(30))
-            .backgroundColor(a.key === 'allow' ? ACCENT : '#282126')
-            .border({ width: 0.5, color: a.key === 'allow' ? '#66ADE9D9' : '#38F1ABA8' })
+            .backgroundColor(a.key === 'allow' ? ACCENT : '#232323')
+            .border({ width: 0.5, color: a.key === 'allow' ? '#66F5F5F5' : '#38DDDDDD' })
             .borderRadius(this.px(15))
             .margin({ top: this.px(6) })
             .clickEffect({ level: ClickEffectLevel.LIGHT })
@@ -2427,12 +2552,18 @@ struct Index {
     CrownMenu({ screenWidth: this.sw, title: '控制中心',
       focusId: 'crown-menu', items: this.menuItems,
       onAction: (key: string) => {
-        if (key === 'sessions') { this.openSessions(); }
-        else if (key === 'local-chat') { this.enterLocal(); }
+        if (key === 'local-chat') { this.enterLocal(); }
         else if (key === 'local') { this.openLocalSettings(); }
         else if (key === 'guide') { this.swiperInitialIndex = this.pageIndex; this.showGuide = true; }
         else { this.switchView(key); }
       } })
+  }
+
+  @Builder
+  ComputersView() {
+    CrownMenu({ screenWidth: this.sw, title: '我的电脑', subtitle: '点按切换 · 各自保存连接',
+      focusId: 'crown-computers', items: this.computerItems,
+      onAction: (key: string) => { this.computerAction(key); } })
   }
 
   @Builder
@@ -2448,7 +2579,12 @@ struct Index {
         .focusOnTouch(true)
         .defaultFocus(true)
       Column() {
-        Text('内网地址')
+        TextInput({ placeholder: '电脑名称', text: this.computerNameEdit })
+          .fontSize(this.vp(10)).fontColor(TEXT).placeholderColor(DIM).width('100%').height(this.px(32))
+          .backgroundColor(BG).borderRadius(this.px(9)).maxLength(40)
+          .onEditChange((editing: boolean) => { this.editingInput = editing; })
+          .onChange((value: string) => { this.computerNameEdit = value; })
+        Text('内网地址').margin({ top: this.px(8) })
           .fontSize(this.vp(7))
           .fontColor(DIM)
         TextInput({ placeholder: '192.168.x.x:8765', text: this.lanEdit })
@@ -2458,8 +2594,8 @@ struct Index {
           .placeholderColor(DIM)
           .height(this.px(24))
           .width('100%')
-          .backgroundColor('#0B171D')
-          .border({ width: 0.5, color: '#35B8E0D6' })
+          .backgroundColor('#151515')
+          .border({ width: 0.5, color: '#35D7D7D7' })
           .borderRadius(this.px(9))
           .margin({ top: this.px(4) })
           .onEditChange((editing: boolean) => { this.editingInput = editing; })
@@ -2475,52 +2611,16 @@ struct Index {
           .placeholderColor(DIM)
           .height(this.px(24))
           .width('100%')
-          .backgroundColor('#0B171D')
-          .border({ width: 0.5, color: '#35B8E0D6' })
+          .backgroundColor('#151515')
+          .border({ width: 0.5, color: '#35D7D7D7' })
           .borderRadius(this.px(9))
           .margin({ top: this.px(4) })
           .onEditChange((editing: boolean) => { this.editingInput = editing; })
           .onChange((v: string) => { this.remoteEdit = v; })
-        TextInput({ placeholder: '6 位配对码', text: this.settingsCode })
-          .type(InputType.Number)
-          .fontSize(this.vp(9))
-          .placeholderFont({ size: this.vp(7) })
-          .fontColor(TEXT)
-          .placeholderColor(DIM)
-          .height(this.px(24))
-          .width('100%')
-          .backgroundColor('#0B171D')
-          .border({ width: 0.5, color: '#35B8E0D6' })
-          .borderRadius(this.px(9))
-          .margin({ top: this.px(5) })
-          .onEditChange((editing: boolean) => { this.editingInput = editing; })
-          .onChange((v: string) => { this.settingsCode = v; })
-        Row() {
-          Text('保存地址')
-            .fontSize(this.vp(8))
-            .fontColor(TEXT)
-            .textAlign(TextAlign.Center)
-            .height(this.px(22))
-            .layoutWeight(1)
-            .backgroundColor('#23343A')
-            .border({ width: 0.5, color: HAIRLINE })
-            .borderRadius(this.px(11))
-            .clickEffect({ level: ClickEffectLevel.LIGHT })
-            .onClick(() => { this.applyServer(); })
-          Text('配对')
-            .fontSize(this.vp(8))
-            .fontColor(INK)
-            .textAlign(TextAlign.Center)
-            .height(this.px(22))
-            .layoutWeight(1)
-            .backgroundColor(ACCENT)
-            .borderRadius(this.px(11))
-            .margin({ left: this.px(6) })
-            .clickEffect({ level: ClickEffectLevel.LIGHT })
-            .onClick(() => { this.pairFromSettings(); })
-        }
-        .width('100%')
-        .margin({ top: this.px(6) })
+        Button('保存当前电脑设置', { type: ButtonType.Capsule })
+          .fontSize(this.vp(9)).fontColor(INK).backgroundColor(ACCENT).width('100%')
+          .height(this.px(34)).margin({ top: this.px(8) }).enabled(!this.connecting)
+          .onClick(() => { this.applyServer(); })
       }
       .alignItems(HorizontalAlign.Start)
       .width('100%')
@@ -2540,44 +2640,44 @@ struct Index {
           .textAlign(TextAlign.Center)
           .height(this.px(20))
           .padding({ left: this.px(10), right: this.px(10) })
-          .backgroundColor(this.netMode === 'auto' ? ACCENT : '#142126')
+          .backgroundColor(this.netMode === 'auto' ? ACCENT : '#191919')
           .borderRadius(this.px(10))
           .clickEffect({ level: ClickEffectLevel.LIGHT })
-          .onClick(() => { this.setNetMode('auto'); })
+          .onClick(() => { this.applyServer('auto'); })
         Text('内网')
           .fontSize(this.vp(8))
           .fontColor(this.netMode === 'lan' ? INK : DIM)
           .textAlign(TextAlign.Center)
           .height(this.px(20))
           .padding({ left: this.px(10), right: this.px(10) })
-          .backgroundColor(this.netMode === 'lan' ? ACCENT : '#142126')
+          .backgroundColor(this.netMode === 'lan' ? ACCENT : '#191919')
           .borderRadius(this.px(10))
           .margin({ left: this.px(4) })
           .clickEffect({ level: ClickEffectLevel.LIGHT })
-          .onClick(() => { this.setNetMode('lan'); })
+          .onClick(() => { this.applyServer('lan'); })
         Text('外网')
           .fontSize(this.vp(8))
           .fontColor(this.netMode === 'remote' ? INK : DIM)
           .textAlign(TextAlign.Center)
           .height(this.px(20))
           .padding({ left: this.px(10), right: this.px(10) })
-          .backgroundColor(this.netMode === 'remote' ? ACCENT : '#142126')
+          .backgroundColor(this.netMode === 'remote' ? ACCENT : '#191919')
           .borderRadius(this.px(10))
           .margin({ left: this.px(4) })
           .clickEffect({ level: ClickEffectLevel.LIGHT })
-          .onClick(() => { this.setNetMode('remote'); })
+          .onClick(() => { this.applyServer('remote'); })
       }
       .width('100%')
       .margin({ top: this.px(10) })
-      Text('解除绑定')
+      Text('移除当前电脑')
         .fontSize(this.vp(10))
         .fontColor(BAD)
         .textAlign(TextAlign.Center)
         .width('100%')
         .height(this.px(30))
         .margin({ top: this.px(9) })
-        .backgroundColor('#282126')
-        .border({ width: 0.5, color: '#38F1ABA8' })
+        .backgroundColor('#232323')
+        .border({ width: 0.5, color: '#38DDDDDD' })
         .borderRadius(this.px(15))
         .clickEffect({ level: ClickEffectLevel.LIGHT })
         .onClick(() => { this.unbind(); })
@@ -2628,7 +2728,7 @@ struct Index {
       const all = await p.getAll();
       const keys: string[] = Object.keys(all);
       for (let i = 0; i < keys.length; i++) {
-        if (keys[i].startsWith('hist_')) {
+        if (keys[i].startsWith('hist_') || keys[i].startsWith('pc_hist_')) {
           await p.delete(keys[i]);
         }
       }
@@ -2671,7 +2771,8 @@ struct Index {
           .defaultFocus(true)
           .onDigitalCrown((event: CrownEvent) => { this.handleCrown(this.diagScroller, event); })
         Column() {
-          this.DiagRow('版本', '2.1.7')
+          this.DiagRow('版本', APP_VERSION)
+          this.DiagRow('电脑', this.activeComputerName)
           this.DiagRow('地址', this.server)
           this.DiagRow('链路', this.linkText())
           this.DiagRow('内网候选', this.lanUrl)
@@ -2702,7 +2803,7 @@ struct Index {
           .width('100%')
           .height(this.px(26))
           .margin({ top: this.px(8) })
-          .backgroundColor('#23343A')
+          .backgroundColor('#313131')
           .border({ width: 0.5, color: HAIRLINE })
           .borderRadius(this.px(13))
           .clickEffect({ level: ClickEffectLevel.LIGHT })
@@ -2723,7 +2824,7 @@ struct Index {
           .width('100%')
           .height(this.px(26))
           .margin({ top: this.px(8) })
-          .backgroundColor('#23343A')
+          .backgroundColor('#313131')
           .border({ width: 0.5, color: HAIRLINE })
           .borderRadius(this.px(13))
           .clickEffect({ level: ClickEffectLevel.LIGHT })
@@ -2735,7 +2836,7 @@ struct Index {
           .width('100%')
           .height(this.px(26))
           .margin({ top: this.px(8) })
-          .backgroundColor('#23343A')
+          .backgroundColor('#313131')
           .border({ width: 0.5, color: HAIRLINE })
           .borderRadius(this.px(13))
           .clickEffect({ level: ClickEffectLevel.LIGHT })
@@ -2747,8 +2848,8 @@ struct Index {
           .width('100%')
           .height(this.px(28))
           .margin({ top: this.px(9) })
-          .backgroundColor('#282126')
-          .border({ width: 0.5, color: '#38F1ABA8' })
+          .backgroundColor('#232323')
+          .border({ width: 0.5, color: '#38DDDDDD' })
           .borderRadius(this.px(14))
           .clickEffect({ level: ClickEffectLevel.LIGHT })
           .onClick(() => { this.clearHistory(); })
@@ -2769,7 +2870,7 @@ struct Index {
 
   @Builder
   SessionsView() {
-    CrownMenu({ screenWidth: this.sw, title: '会话', subtitle: '本地 API · DSH · 表冠滚动选择',
+    CrownMenu({ screenWidth: this.sw, title: '会话', subtitle: this.activeComputerName ? '本地 API · ' + this.activeComputerName.substring(0, 12) : '本地 API · DSH',
       focusId: 'crown-sessions', items: this.pickerItems,
       onAction: (key: string) => { this.pickSession(key).catch(() => { this.toast('切换前保存失败，请重试'); }); } })
   }

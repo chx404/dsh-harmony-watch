@@ -1,1 +1,9 @@
-{"name":"dsh-watch-harmony-build","private":true,"version":"1.0.0"}
+{
+  "name": "dsh-watch-harmony-build",
+  "private": true,
+  "version": "1.0.0",
+  "devDependencies": {
+    "@ohos/hvigor": "6.26.20",
+    "@ohos/hvigor-ohos-plugin": "6.26.20"
+  }
+}
